@@ -228,8 +228,10 @@ def test_arbitrary_geopos_nested_array_elements(env):
     geo_prefix = "memtier-geo-"
     # Pre-populate 3 geo keys (1..3); query range 1..10 to exercise both
     # populated-key (nested-array element) and missing-key (null bulk) paths.
+    # Use execute_command to stay compatible across redis-py 3.x/4.x signatures.
     for i in range(1, _PRELOADED_KEYS + 1):
-        conn.geoadd("{}{}".format(geo_prefix, i), -122.0 - i, 37.0 + i, "loc")
+        conn.execute_command("GEOADD", "{}{}".format(geo_prefix, i),
+                             -122.0 - i, 37.0 + i, "loc")
 
     # Single member query; response is array of [lon, lat] or null per member.
     result = _run_benchmark(env, "GEOPOS __key__ loc", key_prefix=geo_prefix)
