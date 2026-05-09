@@ -29,7 +29,7 @@ LT_INIT
 # working without Python installed.
 AM_PATH_PYTHON([3.6],, [:])
 
-CXXFLAGS="-O2 -g -Wall $CXXFLAGS"
+CXXFLAGS="-O2 -g -Wall -std=c++11 $CXXFLAGS"
 
 # Checks for programs.
 AC_PROG_CXX

@@ -81,13 +81,13 @@ rebuild-man:
 .PHONY: format format-check
 format:
 	@echo "Formatting C++ source files..."
-	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v command_meta_data.h | xargs clang-format -i
+	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | xargs clang-format -i
 	@echo "Done."
 
 format-check:
 	@echo "Checking C++ source file formatting..."
 	@FAILED=0; \
-	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v command_meta_data.h); do \
+	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/); do \
 		if ! clang-format --dry-run --Werror "$$file" 2>/dev/null; then \
 			echo "Needs formatting: $$file"; \
 			FAILED=1; \
@@ -165,6 +165,9 @@ commands-meta-gen:
 	$(PYTHON) $(srcdir)/scripts/gen_command_meta.py \
 	    --in  $(srcdir)/deps/commands_json \
 	    --out $(srcdir)/command_meta_data.h
+	@if command -v clang-format >/dev/null 2>&1; then \
+	    clang-format -i $(srcdir)/command_meta_data.h; \
+	fi
 
 commands-meta-check:
 	@TMP=$$(mktemp); \
