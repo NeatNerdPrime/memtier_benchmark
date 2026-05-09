@@ -860,7 +860,13 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                     }
                     misses = (num_keys > hits) ? (num_keys - hits) : 0;
                 } else {
-                    misses = num_keys;
+                    // Top-level reply isn't an mbulk (could be +OK, -ERR, a
+                    // single bulk for a misshape, or any non-array reply).
+                    // Account uniformly: a single miss bucket so per-key and
+                    // aggregate counters stay in sync.
+                    per_key_hit.assign(1, false);
+                    num_keys = 1;
+                    misses = 1;
                 }
                 break;
             }
