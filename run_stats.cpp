@@ -364,14 +364,15 @@ void run_stats::update_arbitrary_op_misses(size_t arbitrary_index, unsigned int 
     t.total_hits += hits;
     t.total_misses += misses;
 
-    // Lazily size per-key vectors on first call. We trust the caller to use a
-    // stable bucket count per command (set at startup from spec_key_positions
-    // / count_user_key_placeholders); reusing the first-seen size avoids
-    // reallocations on the hot reply path.
+    // Per-key vector sizing: grow-only. ArrayPerElementNulls commands like
+    // HMGET / ZMSCORE produce a variable reply length per call (depends on
+    // how many fields/members were queried), so the bucket count is not
+    // necessarily stable across calls. resize() preserves already-accumulated
+    // counters; an assign()-on-mismatch would silently zero them out.
     if (!per_key_hit.empty()) {
-        if (t.per_key_hits.size() != per_key_hit.size()) {
-            t.per_key_hits.assign(per_key_hit.size(), 0);
-            t.per_key_misses.assign(per_key_hit.size(), 0);
+        if (t.per_key_hits.size() < per_key_hit.size()) {
+            t.per_key_hits.resize(per_key_hit.size(), 0);
+            t.per_key_misses.resize(per_key_hit.size(), 0);
         }
         for (size_t i = 0; i < per_key_hit.size(); ++i) {
             if (per_key_hit[i]) {

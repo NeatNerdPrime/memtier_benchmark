@@ -782,12 +782,17 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 break;
             }
             case ReplyShape::ArrayPerElementNulls: {
-                // Walk the top-level mbulk array. Each element corresponds
-                // positionally to a key in the request (MGET/HMGET/ZMSCORE).
+                // Walk the top-level mbulk array. Bucket count is the reply
+                // element count, not the spec key count: HMGET / ZMSCORE
+                // have 1 Redis key but produce one reply element per
+                // field/member, so capping to num_keys (==1) would lose all
+                // but the first position. MGET (multi-key spec) naturally
+                // matches reply size 1:1.
                 mbulk_size_el *top = response->get_mbulk_value();
                 if (top != NULL) {
                     size_t n = top->mbulks_elements.size();
-                    if (n > num_keys) n = num_keys;
+                    per_key_hit.assign(n, false);
+                    num_keys = (unsigned int) n;
                     for (size_t i = 0; i < n; ++i) {
                         mbulk_element *el = top->mbulks_elements[i];
                         bool h = false;

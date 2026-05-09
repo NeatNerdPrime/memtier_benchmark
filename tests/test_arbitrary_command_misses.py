@@ -185,6 +185,38 @@ def test_arbitrary_miss_tracking_off_omits_per_key_section(env):
     env.assertEqual(all_stats["Gets"]["Misses/sec"], 0.0)
 
 
+def test_arbitrary_hmget_per_field_buckets(env):
+    """HMGET has 1 Redis key but produces N reply elements (one per field).
+    Bucket count must match the reply length (==fields), not the spec key
+    count. Regression for the off-by-one Cursor Bugbot caught.
+    """
+    env.skipOnCluster()
+    env.flush()
+    conn = env.getConnection()
+    # Populate hashes 1..3 with f1, f2 (but NOT f_missing).
+    for i in range(1, _PRELOADED_KEYS + 1):
+        conn.hset("{}{}".format(_KEY_PREFIX, i), mapping={"f1": "v1", "f2": "v2"})
+
+    result = _run_benchmark(env, "HMGET __key__ f1 f2 f_missing")
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("HMGET", per_key)
+    cmd_stats = per_key["HMGET"]
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    # 200 reqs * 2 clients * 3 fields per request
+    env.assertEqual(total_ops, _REQUESTS * 2 * 3)
+    # Exactly 3 buckets (one per reply element / field), not 1 (spec key count).
+    for k in (0, 1, 2):
+        env.assertContains("key[{}] Hits".format(k), cmd_stats)
+    env.assertNotContains("key[3] Hits", cmd_stats)
+    # Field f_missing (position 2) is never present anywhere — 0 hits.
+    env.assertEqual(cmd_stats["key[2] Hits"], 0)
+    env.assertEqual(cmd_stats["key[2] Misses"], _REQUESTS * 2)
+    # Fields f1 and f2 (positions 0, 1) hit only when the hash key is one of
+    # the 3 populated keys.
+    env.assertTrue(cmd_stats["key[0] Hits"] > 0)
+    env.assertTrue(cmd_stats["key[1] Hits"] > 0)
+
+
 def test_arbitrary_geopos_nested_array_elements(env):
     """GEOPOS returns array of (nested-array | null); reply walker must not
     crash on nested-array elements. Regression for the as_bulk() assert that
