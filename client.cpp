@@ -767,8 +767,11 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
             unsigned int num_keys = request->m_keys;
             unsigned int hits = 0;
             unsigned int misses = 0;
+            // Each case allocates per_key_hit at the right size once. Avoiding
+            // a pre-resize here means SingleNullBulk pays only for a 1-bucket
+            // vector and ArrayPerElementNulls pays for one assign() instead of
+            // a resize-then-assign pair on the hot reply path.
             std::vector<bool> per_key_hit;
-            per_key_hit.resize(num_keys, false);
 
             using memtier::command_meta::ReplyShape;
             switch (ar->m_cmd_meta->spec->reply_shape) {
@@ -783,7 +786,12 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 // header, which is what we actually care about: $-1 (null
                 // bulk), *-1 (null array), or anything else (a value).
                 const char *status = response->get_status();
-                bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0));
+                // Miss sentinels: $-1 (null bulk), *-1 (null array, RESP2),
+                // and *0 (empty array - returned by SPOP/SRANDMEMBER with a
+                // count argument when the key is absent). Anything else is
+                // a value (or a non-empty container) and counts as a hit.
+                bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0 ||
+                                                   strcmp(status, "*0") == 0));
                 // Always one bucket for SingleNullBulk: variadic-key blocking
                 // commands like BLPOP carry the winning key in the reply but
                 // we don't parse it, so per-key attribution beyond hit/miss
@@ -862,8 +870,7 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 // carry exactly 1 key.
                 mbulk_size_el *top = response->get_mbulk_value();
                 bool empty = (top == NULL || top->mbulks_elements.empty());
-                for (unsigned int i = 0; i < num_keys; ++i)
-                    per_key_hit[i] = !empty;
+                per_key_hit.assign(num_keys, !empty);
                 hits = empty ? 0 : num_keys;
                 misses = empty ? num_keys : 0;
                 break;
@@ -882,6 +889,7 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 if (n > num_keys) n = num_keys;
                 hits = n;
                 misses = num_keys - n;
+                per_key_hit.assign(num_keys, false);
                 for (unsigned int i = 0; i < hits; ++i)
                     per_key_hit[i] = true;
                 break;
