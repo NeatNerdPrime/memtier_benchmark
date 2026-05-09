@@ -773,12 +773,26 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
             using memtier::command_meta::ReplyShape;
             switch (ar->m_cmd_meta->spec->reply_shape) {
             case ReplyShape::SingleNullBulk: {
-                // Parser counts non-null bulks in m_hits; for K=1 this is 0/1.
-                hits = response->get_hits();
-                if (hits > num_keys) hits = num_keys;
-                misses = num_keys - hits;
-                for (unsigned int i = 0; i < hits; ++i)
-                    per_key_hit[i] = true;
+                // Hit iff the top-level reply isn't a null sentinel. We can't
+                // use response->get_hits() here: the parser increments it for
+                // every non-null bulk it walks, which overcounts for blocking
+                // pop commands (BLPOP/BRPOP/BZPOPMAX/BZPOPMIN return [key,
+                // value] arrays on success — get_hits() returns 2) and for
+                // multi-element pops (LPOP key COUNT N returns an N-element
+                // array). The status line carries the top-level RESP type
+                // header, which is what we actually care about: $-1 (null
+                // bulk), *-1 (null array), or anything else (a value).
+                const char *status = response->get_status();
+                bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0));
+                // Always one bucket for SingleNullBulk: variadic-key blocking
+                // commands like BLPOP carry the winning key in the reply but
+                // we don't parse it, so per-key attribution beyond hit/miss
+                // isn't available.
+                per_key_hit.assign(1, false);
+                num_keys = 1;
+                hits = is_null ? 0 : 1;
+                misses = is_null ? 1 : 0;
+                if (!is_null) per_key_hit[0] = true;
                 break;
             }
             case ReplyShape::ArrayPerElementNulls: {
