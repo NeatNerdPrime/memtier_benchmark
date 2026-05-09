@@ -24,6 +24,11 @@ AM_SILENT_RULES([yes])
 AC_CONFIG_MACRO_DIR([m4])
 LT_INIT
 
+# Python is only required for the maintainer-only `make commands-meta` target.
+# Resolve to ":" (the no-op shell builtin) when absent so end-user builds keep
+# working without Python installed.
+AM_PATH_PYTHON([3.6],, [:])
+
 CXXFLAGS="-O2 -g -Wall $CXXFLAGS"
 
 # Checks for programs.

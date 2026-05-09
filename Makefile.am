@@ -18,7 +18,10 @@
 AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
 CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*'
 
-EXTRA_DIST = README.md COPYING version.sh
+EXTRA_DIST = README.md COPYING version.sh \
+	scripts/fetch_commands_meta.sh \
+	scripts/gen_command_meta.py \
+	deps/commands_json/REDIS_TAG.txt
 
 # Generate version.h before building
 BUILT_SOURCES = version.h
@@ -50,6 +53,7 @@ memtier_benchmark_SOURCES = \
 	item.cpp item.h \
 	file_io.cpp file_io.h \
 	config_types.cpp config_types.h \
+	command_meta.cpp command_meta.h command_meta_data.h \
 	statsd.cpp statsd.h \
 	retry_policy.cpp retry_policy.h \
 	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
@@ -77,13 +81,13 @@ rebuild-man:
 .PHONY: format format-check
 format:
 	@echo "Formatting C++ source files..."
-	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | xargs clang-format -i
+	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v command_meta_data.h | xargs clang-format -i
 	@echo "Done."
 
 format-check:
 	@echo "Checking C++ source file formatting..."
 	@FAILED=0; \
-	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/); do \
+	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v command_meta_data.h); do \
 		if ! clang-format --dry-run --Werror "$$file" 2>/dev/null; then \
 			echo "Needs formatting: $$file"; \
 			FAILED=1; \
@@ -132,3 +136,45 @@ install-hooks:
 	@git config core.hooksPath .githooks
 	@echo "Git hooks enabled (core.hooksPath = .githooks)."
 	@echo "Pre-commit hook will run 'make format-check-staged' on staged C/C++ changes."
+
+# Command metadata vendored from redis/redis@<REDIS_VERSION>.
+# This is a maintainer step, not invoked by `make all`. It refreshes the
+# vendored src/commands/*.json snapshot in deps/commands_json/ and regenerates
+# the command_meta_data.h header consumed by command_meta.cpp.
+#
+# Usage:
+#   make commands-meta                       # uses default pinned version
+#   make commands-meta REDIS_VERSION=8.8     # override branch / tag / sha
+#
+# The two halves can be invoked independently for partial regeneration:
+#   make commands-meta-fetch REDIS_VERSION=unstable
+#   make commands-meta-gen   # rebuild .h from already-vendored JSONs
+#
+# CI guard:
+#   make commands-meta-check                 # fails if .h is stale
+REDIS_VERSION ?= 8.8
+
+.PHONY: commands-meta commands-meta-fetch commands-meta-gen commands-meta-check
+commands-meta: commands-meta-fetch commands-meta-gen
+	@echo "commands-meta: refreshed for redis $(REDIS_VERSION)"
+
+commands-meta-fetch:
+	$(SHELL) $(srcdir)/scripts/fetch_commands_meta.sh $(REDIS_VERSION) $(srcdir)/deps/commands_json
+
+commands-meta-gen:
+	$(PYTHON) $(srcdir)/scripts/gen_command_meta.py \
+	    --in  $(srcdir)/deps/commands_json \
+	    --out $(srcdir)/command_meta_data.h
+
+commands-meta-check:
+	@TMP=$$(mktemp); \
+	$(PYTHON) $(srcdir)/scripts/gen_command_meta.py \
+	    --in  $(srcdir)/deps/commands_json \
+	    --out $$TMP > /dev/null; \
+	if ! diff -u $(srcdir)/command_meta_data.h $$TMP; then \
+	    echo ""; \
+	    echo "command_meta_data.h is stale; run 'make commands-meta-gen'"; \
+	    rm -f $$TMP; exit 1; \
+	fi; \
+	rm -f $$TMP; \
+	echo "command_meta_data.h is up to date."
