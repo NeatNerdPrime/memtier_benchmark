@@ -901,10 +901,18 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 break;
             }
             default:
+                // Unreachable today: miss_tracking_enabled is only set for the
+                // four miss-bearing shapes above. Skip the stats call entirely
+                // here so a future shape addition doesn't silently record
+                // zero-valued hits/misses with an empty per_key_hit; the build
+                // will fail to compile (missing case label) only if -Wswitch
+                // catches it, so the guard makes the intent explicit.
                 break;
             }
 
-            m_stats.update_arbitrary_op_misses(ar->index, hits, misses, per_key_hit);
+            if (!per_key_hit.empty()) {
+                m_stats.update_arbitrary_op_misses(ar->index, hits, misses, per_key_hit);
+            }
         }
 
         // Extract cursor from SCAN response for incremental iteration
