@@ -85,6 +85,29 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
+    // Enable value keeping for arbitrary-command miss tracking when any
+    // configured command needs reply-array inspection (ArrayPerElementNulls or
+    // EmptyCollection). SingleNullBulk and IntegerMembership use the parser's
+    // existing scalar counters so no materialization is required for them.
+    if (config->arbitrary_commands->is_defined()) {
+        bool needs_array_walk = false;
+        for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
+            const arbitrary_command &cmd = config->arbitrary_commands->at(i);
+            if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
+            using memtier::command_meta::ReplyShape;
+            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
+                cmd.spec->reply_shape == ReplyShape::EmptyCollection) {
+                needs_array_walk = true;
+                break;
+            }
+        }
+        if (needs_array_walk) {
+            for (size_t i = 0; i < m_connections.size(); ++i) {
+                m_connections[i]->get_protocol()->set_keep_value(true);
+            }
+        }
+    }
+
     // Parallel key-pattern determined according to the first command
     if ((config->arbitrary_commands->is_defined() && config->arbitrary_commands->at(0).key_pattern == 'P') ||
         (config->key_pattern[key_pattern_set] == 'P')) {
@@ -733,6 +756,95 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         arbitrary_request *ar = static_cast<arbitrary_request *>(request);
         m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
                                     ts_diff(ref_sent, timestamp), ar->index);
+
+        // Per-key miss accounting. Only fires when:
+        //   1. the command resolved to a registry entry (spec != NULL)
+        //   2. miss tracking wasn't disabled by --command-miss-tracking=off
+        //   3. the reply isn't an error (errors are recorded separately by the
+        //      protocol layer; counting them as misses would double-book).
+        if (ar->m_cmd_meta != NULL && ar->m_cmd_meta->miss_tracking_enabled && ar->m_cmd_meta->spec != NULL &&
+            !response->is_error()) {
+            unsigned int num_keys = request->m_keys;
+            unsigned int hits = 0;
+            unsigned int misses = 0;
+            std::vector<bool> per_key_hit;
+            per_key_hit.resize(num_keys, false);
+
+            using memtier::command_meta::ReplyShape;
+            switch (ar->m_cmd_meta->spec->reply_shape) {
+            case ReplyShape::SingleNullBulk: {
+                // Parser counts non-null bulks in m_hits; for K=1 this is 0/1.
+                hits = response->get_hits();
+                if (hits > num_keys) hits = num_keys;
+                misses = num_keys - hits;
+                for (unsigned int i = 0; i < hits; ++i)
+                    per_key_hit[i] = true;
+                break;
+            }
+            case ReplyShape::ArrayPerElementNulls: {
+                // Walk the top-level mbulk array. Each element corresponds
+                // positionally to a key in the request (MGET/HMGET/ZMSCORE).
+                mbulk_size_el *top = response->get_mbulk_value();
+                if (top != NULL) {
+                    size_t n = top->mbulks_elements.size();
+                    if (n > num_keys) n = num_keys;
+                    for (size_t i = 0; i < n; ++i) {
+                        mbulk_element *el = top->mbulks_elements[i];
+                        bool h = false;
+                        if (el != NULL) {
+                            // For commands tagged ArrayPerElementNulls
+                            // (MGET/HMGET/ZMSCORE) every top-level element is
+                            // a bulk; nested arrays would assert in as_bulk().
+                            bulk_el *bel = el->as_bulk();
+                            if (bel != NULL && bel->value != NULL && bel->value_len > 0) {
+                                h = true;
+                            }
+                        }
+                        per_key_hit[i] = h;
+                        if (h) hits++;
+                    }
+                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
+                } else {
+                    misses = num_keys;
+                }
+                break;
+            }
+            case ReplyShape::EmptyCollection: {
+                // Heuristic: empty array == missing key. EmptyCollection
+                // commands (SMEMBERS, LRANGE, HGETALL, ...) virtually always
+                // carry exactly 1 key.
+                mbulk_size_el *top = response->get_mbulk_value();
+                bool empty = (top == NULL || top->mbulks_elements.empty());
+                for (unsigned int i = 0; i < num_keys; ++i)
+                    per_key_hit[i] = !empty;
+                hits = empty ? 0 : num_keys;
+                misses = empty ? num_keys : 0;
+                break;
+            }
+            case ReplyShape::IntegerMembership: {
+                // Reply is ":N\r\n" where N is the count of present keys.
+                // Per-position attribution is impossible from this reply, so
+                // we mark the first N buckets as hits and the rest as misses;
+                // the aggregate is correct, the per-position is conventional.
+                const char *status = response->get_status();
+                unsigned int n = 0;
+                if (status != NULL && status[0] == ':') {
+                    long v = strtol(status + 1, NULL, 10);
+                    if (v > 0) n = (unsigned int) v;
+                }
+                if (n > num_keys) n = num_keys;
+                hits = n;
+                misses = num_keys - n;
+                for (unsigned int i = 0; i < hits; ++i)
+                    per_key_hit[i] = true;
+                break;
+            }
+            default:
+                break;
+            }
+
+            m_stats.update_arbitrary_op_misses(ar->index, hits, misses, per_key_hit);
+        }
 
         // Extract cursor from SCAN response for incremental iteration
         if (m_config->scan_incremental_iteration && !response->is_error()) {

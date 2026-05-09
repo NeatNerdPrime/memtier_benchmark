@@ -266,6 +266,20 @@ Stats are reported separately for "SCAN 0" and "SCAN <cursor>".
 \fB\-\-scan\-incremental\-max\-iterations\fR=\fI\,NUMBER\/\fR
 Maximum number of continuation SCANs per iteration cycle
 (default: 0, follow cursor until it returns 0).
+.TP
+\fB\-\-command\-stats\-breakdown\fR=\fI\,command|line\/\fR
+How to group command statistics in the output (default: command).
+command: aggregate by command name (first word, e.g., SET, GET).
+line: show each command line separately.
+.TP
+\fB\-\-command\-miss\-tracking\fR=\fI\,auto|off\/\fR
+Track per\-key cache misses for arbitrary commands (default: auto).
+.RS
+.IP \(bu 2
+\fIauto\fR: enable for commands with a known reply shape (GET, MGET, HGET, HMGET, GETEX, EXISTS, ...). Driven by the vendored Redis commands.json snapshot at \fIdeps/commands_json/\fR.
+.IP \(bu 2
+\fIoff\fR: disable; mb.json will not contain per\-arbitrary\-command Hits/Misses fields. Use this for backward\-compatible output.
+.RE
 .SS "Object Options:"
 .TP
 \fB\-d\fR  \fB\-\-data\-size\fR=\fI\,SIZE\/\fR

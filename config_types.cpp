@@ -300,7 +300,13 @@ static int hex_digit_to_int(char c)
 }
 
 arbitrary_command::arbitrary_command(const char *cmd) :
-        command(cmd), key_pattern('R'), keys_count(0), ratio(1), stats_only(false)
+        command(cmd),
+        key_pattern('R'),
+        keys_count(0),
+        ratio(1),
+        stats_only(false),
+        spec(NULL),
+        miss_tracking_enabled(false)
 {
     // command name is the first word in the command
     size_t pos = command.find(" ");
@@ -312,6 +318,159 @@ arbitrary_command::arbitrary_command(const char *cmd) :
     std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::toupper);
     // command_type is the same as command_name by default (used for aggregation)
     command_type = command_name;
+}
+
+unsigned int arbitrary_command::count_user_key_placeholders() const
+{
+    unsigned int n = 0;
+    for (size_t i = 0; i < command_args.size(); ++i) {
+        if (command_args[i].data.find(KEY_PLACEHOLDER) != std::string::npos) n++;
+    }
+    return n;
+}
+
+// Evaluate one key_spec against argv and append the discovered 1-based key
+// positions to `out`. Returns false when the spec can't be evaluated (unknown
+// shape, missing keyword, unparseable keynum count, etc.).
+static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const std::vector<command_arg> &args,
+                              std::vector<size_t> &out)
+{
+    using namespace memtier::command_meta;
+
+    int argc = (int) args.size();
+    int start_pos = 0; // 1-based; 0 means "not resolved"
+
+    // BeginSearch: where does the key region begin?
+    if (ks.begin.type == BeginSearchType::Index) {
+        start_pos = ks.begin.pos;
+    } else if (ks.begin.type == BeginSearchType::Keyword) {
+        // commands.json startfrom is 1-based: positive == forward from that index,
+        // negative == backward from end (-1 means start at the last argv slot).
+        int from = ks.begin.startfrom;
+        int direction = (from < 0) ? -1 : 1;
+        int idx = (from < 0) ? (argc + from + 1) : from;
+        if (idx < 1) idx = 1;
+        if (idx > argc) idx = argc;
+        for (; idx >= 1 && idx <= argc; idx += direction) {
+            if (ks.begin.keyword != NULL && strcasecmp(args[idx - 1].data.c_str(), ks.begin.keyword) == 0) {
+                // Keys begin AFTER the keyword token.
+                start_pos = idx + 1;
+                break;
+            }
+        }
+        if (start_pos == 0) return false;
+    } else {
+        return false;
+    }
+
+    if (start_pos < 1 || start_pos > argc) return false;
+
+    // FindKeys: enumerate keys from start_pos.
+    if (ks.find.type == FindKeysType::Range) {
+        int last;
+        if (ks.find.lastkey >= 0) {
+            last = start_pos + ks.find.lastkey;
+        } else {
+            // Negative lastkey: relative to end of argv. -1 == "last argv slot".
+            // commands.json positions are 1-based with position 0 being the
+            // command name; the last valid key index is therefore argc-1, so
+            // lastkey=-1 maps to argc-1, lastkey=-2 to argc-2, etc.
+            last = argc + ks.find.lastkey;
+        }
+        if (last > argc) last = argc;
+        if (last < start_pos) return true; // empty range; nothing to add
+        int step = ks.find.step > 0 ? ks.find.step : 1;
+        int total = last - start_pos + 1;
+        // limit halves (or further divides) the remaining argc when nonzero.
+        if (ks.find.limit > 0) {
+            total = total / ks.find.limit;
+            last = start_pos + total - 1;
+        }
+        for (int p = start_pos; p <= last; p += step) {
+            out.push_back((size_t) p);
+        }
+        return true;
+    } else if (ks.find.type == FindKeysType::Keynum) {
+        int numidx = start_pos + ks.find.keynumidx;
+        if (numidx < 1 || numidx > argc) return false;
+        // Try parsing the arg value as the count. Placeholders (e.g. __data__)
+        // are unparseable and we bail out without populating positions.
+        const std::string &numstr = args[numidx - 1].data;
+        char *end = NULL;
+        long count = strtol(numstr.c_str(), &end, 10);
+        if (numstr.empty() || end == numstr.c_str() || *end != '\0' || count < 0) {
+            return false;
+        }
+        int firstkey = start_pos + ks.find.firstkey;
+        int step = ks.find.keynum_step > 0 ? ks.find.keynum_step : 1;
+        for (long i = 0; i < count; ++i) {
+            int p = firstkey + (int) (i * step);
+            if (p < 1 || p > argc) break;
+            out.push_back((size_t) p);
+        }
+        return true;
+    }
+    return false;
+}
+
+void arbitrary_command::resolve_command_meta()
+{
+    using namespace memtier::command_meta;
+
+    spec = NULL;
+    spec_key_positions.clear();
+    miss_tracking_enabled = false;
+
+    if (command_args.empty()) {
+        return;
+    }
+    // The canonical name for subcommand containers (XGROUP CREATE, OBJECT FREQ,
+    // etc.) is the first two argv tokens uppercased and space-joined. Try both
+    // forms and keep whichever resolves.
+    std::string two_word_name;
+    if (command_args.size() >= 2) {
+        two_word_name.assign(command_args[0].data);
+        two_word_name.push_back(' ');
+        two_word_name.append(command_args[1].data);
+        std::transform(two_word_name.begin(), two_word_name.end(), two_word_name.begin(), ::toupper);
+        spec = lookup(two_word_name.c_str());
+    }
+    if (spec == NULL) {
+        spec = lookup(command_name.c_str());
+    }
+    if (spec == NULL) {
+        // No metadata; this is fine for memcached / module / unknown commands.
+        return;
+    }
+
+    // Evaluate each key spec against the user's argv.
+    for (uint8_t i = 0; i < spec->num_key_specs; ++i) {
+        evaluate_key_spec(spec->key_specs[i], command_args, spec_key_positions);
+    }
+
+    // Cross-check against user's __key__ placeholders. Mismatches are not fatal
+    // (the user might be using a custom routing scheme or a module); just warn.
+    unsigned int user_keys = count_user_key_placeholders();
+    if (!spec_key_positions.empty() && user_keys != spec_key_positions.size()) {
+        fprintf(stderr,
+                "warning: --command \"%s\": spec for %s expects %zu key(s) but %u __key__ placeholder(s) "
+                "were supplied; miss tracking will follow the spec.\n",
+                command.c_str(), spec->name, spec_key_positions.size(), user_keys);
+    }
+
+    // Default-enable miss tracking when the command has a miss-bearing reply
+    // shape. The --command-miss-tracking flag may override this later.
+    switch (spec->reply_shape) {
+    case ReplyShape::SingleNullBulk:
+    case ReplyShape::ArrayPerElementNulls:
+    case ReplyShape::EmptyCollection:
+    case ReplyShape::IntegerMembership:
+        miss_tracking_enabled = true;
+        break;
+    default:
+        miss_tracking_enabled = false;
+        break;
+    }
 }
 
 bool arbitrary_command::set_key_pattern(const char *pattern_str)
