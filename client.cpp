@@ -811,7 +811,19 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                             // kind.
                             if (el->is_bulk()) {
                                 bulk_el *bel = el->as_bulk();
-                                if (bel != NULL && bel->value != NULL && bel->value_len > 0) {
+                                // Hit = the bulk slot carries a value. Use
+                                // value!=NULL (the parser zero-allocates the
+                                // pointer only for $-1 null bulks) so that
+                                // empty-string values ($0\r\n\r\n) count as
+                                // hits when the parser is later extended to
+                                // preserve them. Today the redis_protocol
+                                // parser collapses $0 and $-1 into the same
+                                // representation (value=NULL, value_len=0),
+                                // matching the existing GET path's m_hits
+                                // convention; the value-pointer check is the
+                                // semantically correct one and is forward-
+                                // compatible with a parser that distinguishes.
+                                if (bel != NULL && bel->value != NULL) {
                                     h = true;
                                 }
                             } else if (el->is_mbulk_size()) {

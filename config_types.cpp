@@ -338,7 +338,15 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
     using namespace memtier::command_meta;
 
     int argc = (int) args.size();
-    int start_pos = 0; // 1-based; 0 means "not resolved"
+    int start_pos = 0; // 1-based (Redis convention: pos 0 = command name)
+
+    // Indexing convention: commands.json positions are 1-based with position 0
+    // being the command name; in our 0-based command_args vector that maps
+    // directly (Redis position N = command_args[N], no offset). Earlier code
+    // used args[idx - 1] which read the wrong slot — broken for Keyword
+    // (always read the command name first) and Keynum (read the wrong
+    // argument as the keynum count, e.g. EVAL's "script" instead of
+    // "numkeys"). Range never accessed args[] so the bug was latent.
 
     // BeginSearch: where does the key region begin?
     if (ks.begin.type == BeginSearchType::Index) {
@@ -348,11 +356,11 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
         // negative == backward from end (-1 means start at the last argv slot).
         int from = ks.begin.startfrom;
         int direction = (from < 0) ? -1 : 1;
-        int idx = (from < 0) ? (argc + from + 1) : from;
+        int idx = (from < 0) ? (argc + from) : from;
         if (idx < 1) idx = 1;
-        if (idx > argc) idx = argc;
-        for (; idx >= 1 && idx <= argc; idx += direction) {
-            if (ks.begin.keyword != NULL && strcasecmp(args[idx - 1].data.c_str(), ks.begin.keyword) == 0) {
+        if (idx >= argc) idx = argc - 1;
+        for (; idx >= 1 && idx < argc; idx += direction) {
+            if (ks.begin.keyword != NULL && strcasecmp(args[idx].data.c_str(), ks.begin.keyword) == 0) {
                 // Keys begin AFTER the keyword token.
                 start_pos = idx + 1;
                 break;
@@ -363,7 +371,7 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
         return false;
     }
 
-    if (start_pos < 1 || start_pos > argc) return false;
+    if (start_pos < 1 || start_pos >= argc) return false;
 
     // FindKeys: enumerate keys from start_pos.
     if (ks.find.type == FindKeysType::Range) {
@@ -372,12 +380,11 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
             last = start_pos + ks.find.lastkey;
         } else {
             // Negative lastkey: relative to end of argv. -1 == "last argv slot".
-            // commands.json positions are 1-based with position 0 being the
-            // command name; the last valid key index is therefore argc-1, so
-            // lastkey=-1 maps to argc-1, lastkey=-2 to argc-2, etc.
-            last = argc + ks.find.lastkey;
+            // The last valid key index is argc-1 (since command_args[0] is the
+            // command name), so lastkey=-1 maps to argc-1, -2 to argc-2, etc.
+            last = argc - 1 + ks.find.lastkey + 1;
         }
-        if (last > argc) last = argc;
+        if (last >= argc) last = argc - 1;
         if (last < start_pos) return true; // empty range; nothing to add
         int step = ks.find.step > 0 ? ks.find.step : 1;
         int total = last - start_pos + 1;
@@ -392,10 +399,10 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
         return true;
     } else if (ks.find.type == FindKeysType::Keynum) {
         int numidx = start_pos + ks.find.keynumidx;
-        if (numidx < 1 || numidx > argc) return false;
+        if (numidx < 1 || numidx >= argc) return false;
         // Try parsing the arg value as the count. Placeholders (e.g. __data__)
         // are unparseable and we bail out without populating positions.
-        const std::string &numstr = args[numidx - 1].data;
+        const std::string &numstr = args[numidx].data;
         char *end = NULL;
         long count = strtol(numstr.c_str(), &end, 10);
         if (numstr.empty() || end == numstr.c_str() || *end != '\0' || count < 0) {
@@ -405,7 +412,7 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
         int step = ks.find.keynum_step > 0 ? ks.find.keynum_step : 1;
         for (long i = 0; i < count; ++i) {
             int p = firstkey + (int) (i * step);
-            if (p < 1 || p > argc) break;
+            if (p < 1 || p >= argc) break;
             out.push_back((size_t) p);
         }
         return true;
