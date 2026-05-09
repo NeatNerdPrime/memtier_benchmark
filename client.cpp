@@ -792,12 +792,28 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                         mbulk_element *el = top->mbulks_elements[i];
                         bool h = false;
                         if (el != NULL) {
-                            // For commands tagged ArrayPerElementNulls
-                            // (MGET/HMGET/ZMSCORE) every top-level element is
-                            // a bulk; nested arrays would assert in as_bulk().
-                            bulk_el *bel = el->as_bulk();
-                            if (bel != NULL && bel->value != NULL && bel->value_len > 0) {
-                                h = true;
+                            // ArrayPerElementNulls covers two reply shapes:
+                            //   - array of (bulk | null bulk): MGET, HMGET,
+                            //     ZMSCORE. Null bulk ($-1) materializes as a
+                            //     bulk_el with value==NULL/value_len==0.
+                            //   - array of (nested-array | null array):
+                            //     GEOPOS, COMMAND INFO, SORT_RO. Null array
+                            //     (*-1) materializes as an mbulk_size_el with
+                            //     no children (indistinguishable from *0,
+                            //     which is also "no value here" in practice).
+                            // is_bulk()/is_mbulk_size() avoid the assert that
+                            // as_bulk()/as_mbulk_size() raise on the wrong
+                            // kind.
+                            if (el->is_bulk()) {
+                                bulk_el *bel = el->as_bulk();
+                                if (bel != NULL && bel->value != NULL && bel->value_len > 0) {
+                                    h = true;
+                                }
+                            } else if (el->is_mbulk_size()) {
+                                mbulk_size_el *sub = el->as_mbulk_size();
+                                if (sub != NULL && !sub->mbulks_elements.empty()) {
+                                    h = true;
+                                }
                             }
                         }
                         per_key_hit[i] = h;

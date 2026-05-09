@@ -185,6 +185,35 @@ def test_arbitrary_miss_tracking_off_omits_per_key_section(env):
     env.assertEqual(all_stats["Gets"]["Misses/sec"], 0.0)
 
 
+def test_arbitrary_geopos_nested_array_elements(env):
+    """GEOPOS returns array of (nested-array | null); reply walker must not
+    crash on nested-array elements. Regression for the as_bulk() assert that
+    Cursor Bugbot caught — affects GEOPOS, COMMAND INFO, SORT_RO, etc.
+    """
+    env.skipOnCluster()
+    env.flush()
+    conn = env.getConnection()
+    geo_prefix = "memtier-geo-"
+    # Pre-populate 3 geo keys (1..3); query range 1..10 to exercise both
+    # populated-key (nested-array element) and missing-key (null bulk) paths.
+    for i in range(1, _PRELOADED_KEYS + 1):
+        conn.geoadd("{}{}".format(geo_prefix, i), -122.0 - i, 37.0 + i, "loc")
+
+    # Single member query; response is array of [lon, lat] or null per member.
+    result = _run_benchmark(env, "GEOPOS __key__ loc", key_prefix=geo_prefix)
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("GEOPOS", per_key)
+    cmd_stats = per_key["GEOPOS"]
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+    # Both hits and misses must be observed (not 0/all) — proves the walker
+    # didn't crash and correctly distinguished nested-array from null.
+    env.assertTrue(cmd_stats["Total Hits"] > 0,
+                   message="expected GEOPOS hits on populated geo keys")
+    env.assertTrue(cmd_stats["Total Misses"] > 0,
+                   message="expected GEOPOS misses on missing geo keys")
+
+
 def test_arbitrary_set_not_missable_no_per_key_section(env):
     """SET has reply_shape NotMissable — no Per-Key entry should appear."""
     env.skipOnCluster()

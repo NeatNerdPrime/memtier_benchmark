@@ -42,6 +42,13 @@ public:
     virtual mbulk_size_el *as_mbulk_size() = 0;
     virtual bulk_el *as_bulk() = 0;
 
+    // Safe type predicates so callers can avoid as_bulk() / as_mbulk_size()
+    // assertions when the element kind is unknown (e.g. when walking a
+    // top-level reply array whose elements may be either bulks or nested
+    // arrays, as in GEOPOS, COMMAND INFO, SORT_RO).
+    bool is_bulk() const { return type == mbulk_element_bulk; }
+    bool is_mbulk_size() const { return type == mbulk_element_mbulk_size; }
+
 protected:
     mbulk_element_type type;
 };
