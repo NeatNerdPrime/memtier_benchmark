@@ -387,11 +387,17 @@ static bool evaluate_key_spec(const memtier::command_meta::KeySpec &ks, const st
         if (last >= argc) last = argc - 1;
         if (last < start_pos) return true; // empty range; nothing to add
         int step = ks.find.step > 0 ? ks.find.step : 1;
-        int total = last - start_pos + 1;
-        // limit halves (or further divides) the remaining argc when nonzero.
+        // Total positions in the range, considering stride: positions are
+        // start_pos, start_pos+step, start_pos+2*step, ..., up to last.
+        int total = (last - start_pos) / step + 1;
+        // limit halves (or further divides) the available positions when nonzero.
         if (ks.find.limit > 0) {
             total = total / ks.find.limit;
-            last = start_pos + total - 1;
+            // Recompute last so it lands on the strided position, not on
+            // last-1 contiguous slots (matters once a Redis command pairs
+            // limit > 0 with step > 1; today none do — XREAD/XREADGROUP both
+            // use step=1 — so this is a defensive correctness fix).
+            last = start_pos + (total - 1) * step;
         }
         for (int p = start_pos; p <= last; p += step) {
             out.push_back((size_t) p);
