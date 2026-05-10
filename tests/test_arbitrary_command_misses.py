@@ -257,3 +257,145 @@ def test_arbitrary_set_not_missable_no_per_key_section(env):
     per_key = result["ALL STATS"].get("Per-Key Misses", {})
     # SET should not produce any per-key bookkeeping.
     env.assertNotContains("SET", per_key)
+
+
+def test_arbitrary_spop_with_count_empty_array_is_miss(env):
+    """SPOP key COUNT N returns *0 (empty array) on missing key, not null bulk.
+
+    Regression for Bugbot finding #7: the SingleNullBulk null-sentinel set
+    was {$-1, *-1} only; *0 was misclassified as a hit. With the fix and
+    pre-loaded 3 keys × 5 members each, destructive SPOPs should drain
+    populated sets quickly (~15 hits total) and report the rest as misses.
+    Without the fix, every call would record a hit.
+    """
+    env.skipOnCluster()
+    env.flush()
+    conn = env.getConnection()
+    # 3 keys pre-populated, each with 5 members. SPOP count=1 destroys
+    # one member per successful call, so total successful pops = 15.
+    for i in range(1, _PRELOADED_KEYS + 1):
+        conn.sadd("{}{}".format(_KEY_PREFIX, i), "m1", "m2", "m3", "m4", "m5")
+
+    result = _run_benchmark(env, "SPOP __key__ 1")
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("SPOP", per_key)
+    cmd_stats = per_key["SPOP"]
+
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+    # Misses MUST dominate. Without the *0 fix, Total Misses would be 0.
+    env.assertTrue(cmd_stats["Total Misses"] > cmd_stats["Total Hits"],
+                   message="expected SPOP key COUNT misses on empty/missing keys "
+                           "(seeing {}/{} hits/misses; *0 may not be classified as miss)"
+                           .format(cmd_stats["Total Hits"], cmd_stats["Total Misses"]))
+
+
+def test_arbitrary_blpop_variadic_keys_single_bucket(env):
+    """BLPOP key1 key2 ... timeout returns [winning_key, value] on success.
+
+    Regression for Bugbot finding #6: the SingleNullBulk handler used
+    response->get_hits() (which counts every non-null bulk recursively),
+    causing BLPOP/BRPOP/BZPOPMAX/BZPOPMIN replies to inflate hit counts
+    and report multiple per-key buckets. With the fix, BLPOP must always
+    show exactly one bucket regardless of how many key slots the user
+    supplied; we don't currently parse the winning key from the reply.
+    """
+    env.skipOnCluster()
+    env.flush()
+    conn = env.getConnection()
+    # Preload memtier-1 with enough items so every BLPOP call returns
+    # immediately (the test fixes key range to [1,1] below to guarantee that).
+    for _ in range(_REQUESTS * 2 + 10):
+        conn.rpush("{}1".format(_KEY_PREFIX), "v")
+
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {
+        "name": env.testName,
+        # Three key slots + 1s timeout. Key range [1,1] makes every pick
+        # land on the populated memtier-1 list, so BLPOP returns instantly.
+        "args": [
+            "--command=BLPOP __key__ __key__ __key__ 1",
+            "--command-key-pattern=R",
+            "--command-stats-breakdown=line",
+            "--key-prefix={}".format(_KEY_PREFIX),
+            "--key-minimum=1",
+            "--key-maximum=1",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=_REQUESTS)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    env.assertTrue(benchmark.run())
+    debugPrintMemtierOnError(config, env)
+
+    with open("{}/mb.json".format(config.results_dir)) as fh:
+        result = json.load(fh)
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("BLPOP", per_key)
+    cmd_stats = per_key["BLPOP"]
+    # Exactly one bucket, regardless of the 3 __key__ placeholders.
+    # Without the fix, get_hits()=2 for [key,value] reply would mark two
+    # buckets as hit and one as miss per call.
+    env.assertContains("key[0] Hits", cmd_stats)
+    env.assertNotContains("key[1] Hits", cmd_stats,
+                          message="BLPOP should produce a single bucket; per-key "
+                                  "attribution beyond hit/miss isn't extracted")
+
+
+def test_arbitrary_xread_keyword_spec_evaluates_correctly(env):
+    """XREAD COUNT N STREAMS key id uses Keyword begin_search.
+
+    Regression for Bugbot finding #4 (Keyword/Keynum off-by-one in
+    evaluate_key_spec). Before the fix, args[idx-1] always read the
+    command name first, mis-locating the STREAMS keyword. With the fix
+    XREAD's spec resolves correctly and miss tracking works against the
+    SingleNullBulk shape (object reply on hit, null on miss).
+    """
+    env.skipOnCluster()
+    env.flush()
+    conn = env.getConnection()
+    # Preload 3 streams (memtier-1..3) each with one entry.
+    for i in range(1, _PRELOADED_KEYS + 1):
+        conn.execute_command("XADD", "{}{}".format(_KEY_PREFIX, i), "*", "f", "v")
+
+    result = _run_benchmark(env, "XREAD COUNT 1 STREAMS __key__ 0")
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("XREAD", per_key)
+    cmd_stats = per_key["XREAD"]
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+    # Both hits and misses must be observable, proving the Keyword spec
+    # resolved correctly and SingleNullBulk routed status to is_null check.
+    env.assertTrue(cmd_stats["Total Hits"] > 0,
+                   message="expected XREAD hits on populated streams")
+    env.assertTrue(cmd_stats["Total Misses"] > 0,
+                   message="expected XREAD misses on missing streams")
+
+
+def test_arbitrary_eval_keynum_spec_runs_cleanly(env):
+    """EVAL has Keynum begin_search; verify resolve_command_meta doesn't crash.
+
+    EVAL's reply_shape is NotMissable (script return value is opaque), so
+    no Per-Key entry should appear — but the Keynum spec evaluation must
+    not abort the run. Regression for Bugbot finding #4 (Keynum path
+    previously read the wrong arg via args[idx-1] = "script body" instead
+    of args[idx] = "numkeys", causing strtol to fail).
+    """
+    env.skipOnCluster()
+    _preload_strings(env)
+
+    # Minimal script returning 1; numkeys=1 followed by one __key__.
+    result = _run_benchmark(env, "EVAL return 1 1 __key__")
+    all_stats = result["ALL STATS"]
+    per_key = all_stats.get("Per-Key Misses", {})
+    # NotMissable -> no per-key bookkeeping for EVAL.
+    env.assertNotContains("EVAL", per_key)
+    # But the run must have produced ops — proves EVAL command was sent
+    # and parsed without the Keynum evaluator aborting startup.
+    eval_entry = all_stats.get("Evals", {})
+    env.assertTrue(eval_entry.get("Count", 0) > 0,
+                   message="expected EVAL to run (Keynum spec evaluation)")
