@@ -40,6 +40,15 @@ protected:
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id, struct timeval timestamp, request *request, protocol_response *response);
     void handle_ask(unsigned int conn_id, struct timeval timestamp, request *request, protocol_response *response);
+    // Resend the request on the slot-owning connection (or same connection if
+    // routing info isn't available yet). Returns true if ownership of `req`
+    // transferred to a retry queue.
+    bool retry_after_redirect(unsigned int conn_id, request *req);
+    // Terminal accounting for a MOVED/ASK request whose retry was refused
+    // (e.g. max_retries exhausted, retry queue full, no captured bytes). Logs
+    // to --failed-keys-file if configured and increments the error counter,
+    // so the request doesn't silently disappear from the stats.
+    void finalize_dropped_redirect(struct timeval timestamp, request *req, protocol_response *response);
 
 public:
     cluster_client(client_group *group);
