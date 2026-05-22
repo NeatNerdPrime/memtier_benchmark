@@ -375,7 +375,7 @@ def test_reconnect_unlimited_no_spurious_thread_restart(env):
     # than the actual attempt count, then killed the thread.
     env.assertFalse(
         "Maximum reconnection attempts (0) exceeded" in stderr_content,
-        "Spurious thread-kill message found: duplicate error callback while "
+        message="Spurious thread-kill message found: duplicate error callback while "
         "reconnect already pending incorrectly triggered event_base_loopbreak()",
     )
 
