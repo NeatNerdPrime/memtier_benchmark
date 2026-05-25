@@ -197,14 +197,15 @@ void cluster_client::disconnect(void)
         sc->disconnect();
     }
 
-    // delete all connections except main connection; shrink parallel vectors in lockstep
+    // delete all connections except main connection
     for (i = conn_size - 1; i > 0; i--) {
         shard_connection *sc = m_connections.back();
         m_connections.pop_back();
         delete sc;
-        // m_key_index_pools entries are intentionally kept (owned heap objects reused on reconnect)
-        // m_staged_monitor_commands must shrink to match m_connections so indices stay valid
-        m_staged_monitor_commands.pop_back();
+        // m_key_index_pools and m_staged_monitor_commands are intentionally NOT shrunk:
+        // their entries are cleared by connect_shard_connection() on the next reconnect.
+        // Keeping them here avoids a size divergence between the two parallel vectors
+        // (which would fire the assert in create_shard_connection on re-connect).
     }
 }
 
@@ -674,6 +675,9 @@ void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/
     if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(staged.parsed_cmd)) {
         benchmark_error_log("warning: skipping unformattable staged monitor command at line %zu\n",
                             staged.source_line);
+        // m_reqs_generated was incremented when this command was staged. Undo it now so
+        // a --requests run doesn't hang waiting for a response that will never arrive.
+        m_reqs_generated--;
         return;
     }
 
@@ -683,6 +687,12 @@ void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/
         if (arg->type == const_type) {
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
         }
+    }
+    if (cmd_size == 0) {
+        // format_arbitrary_command succeeded but produced no sendable bytes — guard against
+        // pushing a zero-length phantom request that the server would never respond to.
+        m_reqs_generated--;
+        return;
     }
     // Use the enqueue timestamp so latency reflects selection→response, not drain→response.
     m_connections[conn_id]->send_arbitrary_command_end(staged.stats_index, &staged.enqueue_time, cmd_size);
@@ -709,7 +719,9 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
     if (!temp_cmd.split_command_to_args()) {
         benchmark_error_log("warning: skipping malformed monitor command at line %zu: %s\n", selected_index + 1,
                             raw_cmd.c_str());
-        return true;
+        // Return false so m_reqs_generated is not incremented — no request was sent
+        // and no response will arrive, so incrementing would cause a --requests hang.
+        return false;
     }
 
     // Determine target shard from the first key argument (index 1 = first arg after command name).
@@ -734,21 +746,24 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         // format_arbitrary_command is intentionally deferred to drain: it mutates arg->data
         // in-place with RESP framing and must be called per-connection at send time.
         // Cap the queue to prevent unbounded memory growth under skewed workloads.
-        if (m_staged_monitor_commands[target_conn].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
-            benchmark_debug_log("staged monitor queue for conn %u full, dropping command\n", target_conn);
-            m_stats.inc_error();
+        if (m_staged_monitor_commands[target_conn].size() < STAGED_MONITOR_QUEUE_MAX_SIZE) {
+            staged_monitor_cmd staged{std::move(temp_cmd), stats_index, timestamp, selected_index + 1};
+            m_staged_monitor_commands[target_conn].push(std::move(staged));
+            m_connections[target_conn]->schedule_fill();
             return true;
         }
-        staged_monitor_cmd staged{std::move(temp_cmd), stats_index, timestamp, selected_index + 1};
-        m_staged_monitor_commands[target_conn].push(std::move(staged));
-        m_connections[target_conn]->schedule_fill();
-        return true;
+        // Staged queue is full: fall through and send directly on conn_id.
+        // Redis will issue -MOVED; handle_moved() refreshes topology so future
+        // commands route correctly. Sending here is safe and avoids a --requests hang
+        // that would result from silently dropping a counted request.
+        benchmark_debug_log("staged monitor queue for conn %u full, sending directly on conn %u (expect MOVED)\n",
+                            target_conn, conn_id);
     }
 
-    // The slot belongs to this connection — format and send inline.
+    // The slot belongs to this connection (or queue-full fallback) — format and send inline.
     if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(temp_cmd)) {
         benchmark_error_log("warning: skipping unformattable monitor command at line %zu\n", selected_index + 1);
-        return true;
+        return false;
     }
 
     int cmd_size = 0;
