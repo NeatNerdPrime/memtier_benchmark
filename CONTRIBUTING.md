@@ -20,7 +20,7 @@ git clone git@github.com:redis/memtier_benchmark.git
 cd memtier_benchmark
 autoreconf -ivf
 ./configure
-make -j
+make
 ```
 
 The binary is produced at `./memtier_benchmark`. Run `sudo make install` to install system-wide.
