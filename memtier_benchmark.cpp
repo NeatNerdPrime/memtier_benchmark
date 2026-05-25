@@ -298,6 +298,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "test_time = %u\n"
             "ratio = %u:%u\n"
             "pipeline = %u\n"
+            "transaction = %s\n"
             "data_size = %u\n"
             "data_offset = %u\n"
             "random_data = %s\n"
@@ -345,14 +346,14 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->tls_sni,
 #endif
             cfg->out_file, cfg->client_stats, cfg->run_count, cfg->debug, cfg->requests, cfg->request_rate,
-            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline, cfg->data_size,
-            cfg->data_offset, cfg->random_data ? "yes" : "no", cfg->data_size_range.min, cfg->data_size_range.max,
-            cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1), cfg->data_size_pattern, cfg->expiry_range.min,
-            cfg->expiry_range.max, cfg->data_import, cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no",
-            cfg->generate_keys ? "yes" : "no", cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern,
-            cfg->key_stddev, cfg->key_median, cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no",
-            cfg->max_retries, cfg->retry_backoff_ms, cfg->retry_backoff_factor,
-            cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
+            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
+            cfg->transaction ? "yes" : "no", cfg->data_size, cfg->data_offset, cfg->random_data ? "yes" : "no",
+            cfg->data_size_range.min, cfg->data_size_range.max, cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1),
+            cfg->data_size_pattern, cfg->expiry_range.min, cfg->expiry_range.max, cfg->data_import,
+            cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no", cfg->generate_keys ? "yes" : "no",
+            cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern, cfg->key_stddev, cfg->key_median,
+            cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no", cfg->max_retries, cfg->retry_backoff_ms,
+            cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
             cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
             cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
@@ -394,6 +395,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("test_time", "%u", cfg->test_time);
     jsonhandler->write_obj("ratio", "\"%u:%u\"", cfg->ratio.a, cfg->ratio.b);
     jsonhandler->write_obj("pipeline", "%u", cfg->pipeline);
+    jsonhandler->write_obj("transaction", "\"%s\"", cfg->transaction ? "true" : "false");
     jsonhandler->write_obj("data_size", "%u", cfg->data_size);
     jsonhandler->write_obj("data_offset", "%u", cfg->data_offset);
     jsonhandler->write_obj("random_data", "\"%s\"", cfg->random_data ? "true" : "false");
@@ -712,6 +714,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_wait_timeout,
         o_json_out_file,
         o_cluster_mode,
+        o_transaction,
         o_command,
         o_command_key_pattern,
         o_command_ratio,
@@ -817,6 +820,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"wait-timeout", 1, 0, o_wait_timeout},
         {"json-out-file", 1, 0, o_json_out_file},
         {"cluster-mode", 0, 0, o_cluster_mode},
+        {"transaction", 0, 0, o_transaction},
         {"help", 0, 0, o_help},
         {"version", 0, 0, 'v'},
         {"command", 1, 0, o_command},
@@ -1295,6 +1299,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_cluster_mode:
             cfg->cluster_mode = true;
             break;
+        case o_transaction:
+            cfg->transaction = true;
+            break;
         case o_command: {
             // Check if this is a monitor placeholder
             const char *cmd_str = optarg;
@@ -1523,6 +1530,38 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         }
     }
 
+    // --transaction needs at least one --command to operate on. In
+    // --cluster-mode the flag changes routing; in standalone it is a no-op
+    // (each client has a single connection, so the rotation already runs
+    // through one socket in order), but we accept it so scripts that toggle
+    // --cluster-mode don't have to also toggle --transaction.
+    if (cfg->transaction && !cfg->arbitrary_commands->is_defined()) {
+        fprintf(stderr, "error: --transaction requires at least one --command.\n");
+        return -1;
+    }
+
+    if (cfg->transaction && !cfg->cluster_mode) {
+        fprintf(stderr, "warning: --transaction has no effect without --cluster-mode. "
+                        "In standalone mode every client uses a single connection so commands "
+                        "are already serialized in order.\n");
+    }
+
+    if (cfg->transaction && cfg->pipeline > 1 && cfg->arbitrary_commands->is_defined()) {
+        for (size_t i = 0; i < cfg->arbitrary_commands->size(); i++) {
+            const char *n = cfg->arbitrary_commands->at(i).command_name.c_str();
+            if (strcasecmp(n, "MULTI") == 0 || strcasecmp(n, "EXEC") == 0 || strcasecmp(n, "WATCH") == 0 ||
+                strcasecmp(n, "DISCARD") == 0 || strcasecmp(n, "UNWATCH") == 0) {
+                fprintf(stderr,
+                        "error: --transaction with MULTI/EXEC/WATCH/DISCARD/UNWATCH requires --pipeline=1 "
+                        "(--pipeline=%u): with depth > 1 multiple rotations are in-flight "
+                        "simultaneously on the pin connection, interleaving MULTI/EXEC blocks "
+                        "and breaking transaction semantics.\n",
+                        cfg->pipeline);
+                return -1;
+            }
+        }
+    }
+
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
@@ -1572,6 +1611,17 @@ void usage()
         "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
+        "      --transaction              In --cluster-mode, pin one full rotation of --command entries to\n"
+        "                                 a single shard connection so that keyless commands (MULTI/EXEC/\n"
+        "                                 UNWATCH) stay on the same connection as the keyed ones. Hash-tag\n"
+        "                                 your keys so they map to the same slot, otherwise the cross-slot\n"
+        "                                 keyed commands of the same rotation will get MOVED back. In\n"
+        "                                 standalone mode this flag is a no-op (each client already runs\n"
+        "                                 through a single connection). Requires at least one --command.\n"
+        "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
+        "                                 interrupted rotation's stats will be inaccurate (server-side\n"
+        "                                 WATCH/MULTI state is lost on reconnect). Use --pipeline=1\n"
+        "                                 with WATCH to avoid cross-slot pipeline interference.\n"
         "  -h, --help                     Display this help\n"
         "  -v, --version                  Display version information\n"
         "\n"
@@ -2885,7 +2935,7 @@ int main(int argc, char *argv[])
 
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");
-        config_print(stdout, &cfg);
+        config_print(stderr, &cfg);
         fprintf(stderr, "===================================================\n");
     }
 

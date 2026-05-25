@@ -94,9 +94,40 @@ static uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
     return rv;
 }
 
+// Hash-tag-aware variant of calc_hslot_crc16_cluster. Mirrors Redis' rule
+// (https://redis.io/docs/reference/cluster-spec/#hash-tags): if the key
+// contains a {tag} substring with at least one byte between the braces, only
+// the bytes inside the first such {tag} are hashed; otherwise the whole key
+// is hashed. memtier's default slot computation skips this rule because the
+// generic routing path only sees obj_gen->get_key() — never the literal
+// affixes like "{mx}-" that the user wrote in --command. This helper is used
+// by --transaction to pin to the actual slot owner.
+static uint32_t calc_hslot_crc16_with_hash_tag(const char *str, size_t length)
+{
+    const char *open = (const char *) memchr(str, '{', length);
+    if (open != NULL) {
+        size_t remaining = length - (open - str) - 1;
+        const char *close = (const char *) memchr(open + 1, '}', remaining);
+        if (close != NULL && close > open + 1) {
+            size_t tag_len = close - open - 1;
+            return (uint32_t) crc16(open + 1, tag_len) & MAX_CLUSTER_HSLOT;
+        }
+    }
+    return (uint32_t) crc16(str, length) & MAX_CLUSTER_HSLOT;
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
-cluster_client::cluster_client(client_group *group) : client(group) {}
+cluster_client::cluster_client(client_group *group) :
+        client(group),
+        m_txn_pinned_conn_id(-1),
+        m_txn_observed_rotation_seq(0),
+        m_txn_staged_key_index(0),
+        m_txn_has_staged_key(false),
+        m_txn_pin_lost_warned(false)
+{
+    memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
+}
 
 cluster_client::~cluster_client()
 {
@@ -132,8 +163,28 @@ int cluster_client::connect(void)
     return 0;
 }
 
+void cluster_client::txn_release_pin()
+{
+    if (m_txn_has_staged_key) {
+        // Return the staged key to the pin connection's pool so the next
+        // rotation can reuse it. Without this, every mid-rotation pin reset
+        // (MOVED, disconnect) silently burns one key from the sequential
+        // iterator, permanently skipping that index under --key-pattern=S.
+        m_key_index_pools[m_txn_pinned_conn_id]->push(m_txn_staged_key_index);
+        m_txn_has_staged_key = false;
+    }
+    m_txn_pinned_conn_id = -1;
+}
+
 void cluster_client::disconnect(void)
 {
+    // Reset transaction pin state so a post-reconnect topology with fewer
+    // shards doesn't leave m_txn_pinned_conn_id pointing past the end of
+    // m_connections (which would be an out-of-bounds access).
+    m_txn_pinned_conn_id = -1;
+    m_txn_has_staged_key = false;
+    m_txn_pin_lost_warned = false;
+
     unsigned int conn_size = m_connections.size();
     unsigned int i;
 
@@ -286,12 +337,45 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
 bool cluster_client::hold_pipeline(unsigned int conn_id)
 {
     if (m_connections[conn_id]->get_connection_state() == conn_disconnected) {
+        if (m_config->transaction && m_txn_pinned_conn_id == (int) conn_id && !m_txn_pin_lost_warned) {
+            m_txn_pin_lost_warned = true;
+            benchmark_error_log("warning: --transaction pin connection (id=%u) disconnected mid-rotation; "
+                                "transaction stats for the interrupted rotation will be inaccurate.\n",
+                                conn_id);
+            // Release the pin so non-pin connections can resume the rotation.
+            txn_release_pin();
+            for (size_t i = 0; i < m_connections.size(); i++) {
+                if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
+                    m_connections[i]->schedule_fill();
+                }
+            }
+        }
         return true;
     }
 
     /* Don't exceed requests. */
     if (m_config->requests) {
         if (m_key_index_pools[conn_id]->empty() && m_reqs_generated >= m_config->requests) {
+            return true;
+        }
+    }
+
+    /* In transaction mode the pin connection drives the entire rotation.
+     * Non-pin connections must not spin in fill_pipeline; they will be
+     * rescheduled via schedule_fill() when the pin is cleared. If the pin
+     * connection has disconnected, release it so the remaining connections
+     * are not blocked indefinitely. */
+    if (m_config->transaction && m_txn_pinned_conn_id != -1 && m_txn_pinned_conn_id != (int) conn_id) {
+        if (m_connections[m_txn_pinned_conn_id]->get_connection_state() == conn_disconnected) {
+            // Pin dropped; clear it and wake sibling connections so they are
+            // not left blocked indefinitely waiting for the disconnected pin.
+            txn_release_pin();
+            for (size_t i = 0; i < m_connections.size(); i++) {
+                if ((unsigned int) i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
+                    m_connections[i]->schedule_fill();
+                }
+            }
+        } else {
             return true;
         }
     }
@@ -355,8 +439,156 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
      * if the generated key belongs to this connection before starting to send it */
     assert(m_key_index_pools[conn_id]->empty());
 
+    const arbitrary_command &cmd = get_arbitrary_command(command_index);
+
+    /* --transaction: one full rotation of --command entries = one transactional
+     * unit (e.g. WATCH/MULTI/.../EXEC). Pin every command in the rotation to a
+     * single shard connection so keyless commands stay on the same connection
+     * as the keyed ones. The pin is set on the first command of a rotation and
+     * cleared when the rotation wraps back to index 0 (detected here via index
+     * 0 + ratio counter 0). */
+    if (m_config->transaction) {
+        // The cluster-mode startup guard at memtier_benchmark.cpp rejects
+        // arbitrary commands with keys_count > 1, so the single-key pool
+        // layout below is sufficient. If cluster mode ever grows multi-key
+        // arbitrary command support, the pool push has to loop over every
+        // key_type arg.
+        assert(cmd.keys_count <= 1);
+
+        if (m_arbitrary_command_rotation_seq != m_txn_observed_rotation_seq) {
+            m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
+            m_txn_pinned_conn_id = -1;
+            m_txn_has_staged_key = false;
+            m_txn_pin_lost_warned = false;
+            /* Wake up connections that were held back by hold_pipeline so
+             * they can participate in the new rotation's lookahead. */
+            for (size_t i = 0; i < m_connections.size(); i++) {
+                if ((unsigned int) i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
+                    m_connections[i]->schedule_fill();
+                }
+            }
+        }
+
+        if (m_txn_pinned_conn_id == -1) {
+            /* Pin the rotation to the shard that owns the first KEYED
+             * command in this rotation. A rotation that starts with one or
+             * more keyless commands (e.g. MULTI before SET) must still be
+             * routed to the slot of the upcoming keyed command, otherwise
+             * the keyless commands land on an arbitrary shard and the
+             * keyed commands then MOVED-back to the right one — breaking
+             * transaction state. If the rotation has no keyed commands at
+             * all, fall back to the current connection.
+             *
+             * Critically, the key the lookahead generates is *not* thrown
+             * away. obj_gen->get_key_index() advances the per-iter
+             * sequential counter (and similarly for Zipfian/etc.), so
+             * discarding it would burn an extra key per rotation —
+             * halving the effective key range under --key-pattern=S.
+             * Instead we stash the key_index in m_txn_staged_key_index,
+             * and the actual send for that command_index pushes it onto
+             * the pool just before calling client::create_arbitrary_request. */
+            int target_conn = -1;
+            unsigned long long staged_key_index = 0;
+            bool have_staged_key = false;
+            m_txn_has_staged_key = false;
+            unsigned int total = m_config->arbitrary_commands->size();
+            for (unsigned int off = 0; off < total; off++) {
+                unsigned int look_idx = (m_executed_command_index + off) % total;
+                const arbitrary_command &look = get_arbitrary_command(look_idx);
+                if (look.stats_only) continue;
+                if (look.keys_count == 0) continue;
+
+                client::get_key_for_conn(look_idx, conn_id, &staged_key_index);
+                have_staged_key = true;
+
+                /* Reconstruct the actual key string that would be sent on
+                 * the wire — data_prefix + obj_gen.get_key() + data_suffix
+                 * — and hash it the way Redis does (honoring {tag}
+                 * substrings). The default memtier slot computation only
+                 * sees the generated portion of the key, so it would
+                 * route to a random shard when the keyed argument carries
+                 * hash-tag affixes. */
+                const command_arg *key_arg = NULL;
+                for (size_t a = 0; a < look.command_args.size(); a++) {
+                    if (look.command_args[a].type == key_type) {
+                        key_arg = &look.command_args[a];
+                        break;
+                    }
+                }
+                const char *gen_key = m_obj_gen->get_key();
+                unsigned int gen_key_len = m_obj_gen->get_key_len();
+                unsigned int hslot;
+                if (key_arg != NULL && key_arg->has_key_affixes) {
+                    std::string full;
+                    full.reserve(key_arg->data_prefix.size() + gen_key_len + key_arg->data_suffix.size());
+                    full.append(key_arg->data_prefix);
+                    full.append(gen_key, gen_key_len);
+                    full.append(key_arg->data_suffix);
+                    hslot = calc_hslot_crc16_with_hash_tag(full.data(), full.size());
+                } else {
+                    hslot = calc_hslot_crc16_with_hash_tag(gen_key, gen_key_len);
+                }
+                target_conn = (int) m_slot_to_shard[hslot];
+                break;
+            }
+            /* If we couldn't find a keyed cmd, or the slot mapping isn't
+             * populated yet (target_conn out of range), or the elected shard
+             * is currently disconnected (e.g. pin just dropped and hasn't
+             * reconnected yet), fall back to the current conn so the rotation
+             * can proceed rather than re-pinning to a dead connection and
+             * permanently stalling all other conns via hold_pipeline. */
+            if (target_conn < 0 || target_conn >= (int) m_connections.size() ||
+                m_connections[target_conn]->get_connection_state() == conn_disconnected) {
+                target_conn = (int) conn_id;
+                // keep have_staged_key: the key was already generated and the
+                // sequential counter advanced, so we must reuse it here (on
+                // the fallback conn_id pool) rather than discarding it and
+                // leaving a gap in the sequential key range.
+            }
+            m_txn_pinned_conn_id = target_conn;
+            if (have_staged_key) {
+                m_txn_staged_key_index = staged_key_index;
+                m_txn_has_staged_key = true;
+            }
+        }
+
+        /* Only the pinned connection drives the rotation. Non-pin conns
+         * return false so they don't advance m_executed_command_index or
+         * generate a request. The event loop will call the pin connection
+         * itself, which sends the command in order. Returning false here
+         * (rather than queueing onto the pin's pool) keeps the pin's
+         * pipeline depth honest — otherwise late-rotation MULTI/SET
+         * fragments would pile up in the pool and get dropped at
+         * shutdown, silently losing committed-side data.
+         *
+         * If the pin was just assigned to a different connection, wake it
+         * up explicitly. Without this, a pin whose bufferevent was silenced
+         * by the idle path (e.g. it was a non-pin held by hold_pipeline)
+         * would never call fill_pipeline again and the benchmark deadlocks. */
+        if ((unsigned int) m_txn_pinned_conn_id != conn_id) {
+            m_connections[m_txn_pinned_conn_id]->schedule_fill();
+            return false;
+        }
+
+        /* For keyed commands the lookahead may have pre-generated a key
+         * stored in m_txn_staged_key_index. Use it so the per-iter key
+         * counter advances exactly once per rotation. */
+        if (cmd.keys_count > 0) {
+            if (m_txn_has_staged_key) {
+                m_key_index_pools[conn_id]->push(m_txn_staged_key_index);
+                m_txn_has_staged_key = false;
+            } else if (m_key_index_pools[conn_id]->empty()) {
+                unsigned long long key_index;
+                client::get_key_for_conn(command_index, conn_id, &key_index);
+                m_key_index_pools[conn_id]->push(key_index);
+            }
+        }
+        client::create_arbitrary_request(command_index, timestamp, conn_id);
+        return true;
+    }
+
     /* keyless command can be used by any connection */
-    if (get_arbitrary_command(command_index).keys_count == 0) {
+    if (cmd.keys_count == 0) {
         client::create_arbitrary_request(command_index, timestamp, conn_id);
         return true;
     }
@@ -464,7 +696,11 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
 
     unsigned int target = conn_id;
     if (req->m_key && req->m_key_len > 0) {
-        unsigned int hslot = calc_hslot_crc16_cluster(req->m_key, req->m_key_len);
+        // Use the hash-tag-aware variant so a retry of an arbitrary command
+        // whose key carries a {tag} prefix (e.g. "{foo}-key-5") routes to
+        // the correct shard. calc_hslot_crc16_cluster hashes the full string
+        // and would map to a different slot, causing an infinite MOVED loop.
+        unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
         unsigned int mapped = m_slot_to_shard[hslot];
         // Only route to a different connection if it's actually ready; otherwise
         // fall back to the same connection (CLUSTER SLOTS may still be in flight).
@@ -517,12 +753,31 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // handle "-MOVED"
         if (strncmp(response->get_status(), MOVED_MSG_PREFIX, MOVED_MSG_PREFIX_LEN) == 0) {
             handle_moved(conn_id, timestamp, request, response);
-            // With --retry-on-error, the captured command bytes are resent on
-            // the slot-owning connection. MOVED/ASK count toward max_retries.
-            // If the retry is refused (budget exhausted / queue full / no
-            // captured bytes), account it as a terminal error so the request
-            // doesn't silently disappear from the stats.
-            if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            // With --transaction, retrying a mid-rotation command on the new
+            // slot owner would split the MULTI/EXEC block across two shard
+            // connections. Drop the rotation instead, reset the pin so the
+            // next rotation can start fresh on the updated topology, and warn
+            // once about stat inaccuracy.
+            if (m_config->transaction && (int) conn_id == m_txn_pinned_conn_id) {
+                if (!m_txn_pin_lost_warned) {
+                    m_txn_pin_lost_warned = true;
+                    benchmark_error_log("warning: --transaction pin connection (id=%u) received MOVED "
+                                        "mid-rotation; topology changed; transaction stats for the "
+                                        "interrupted rotation will be inaccurate.\n",
+                                        conn_id);
+                }
+                txn_release_pin();
+                for (size_t i = 0; i < m_connections.size(); i++) {
+                    if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                        m_connections[i]->schedule_fill();
+                }
+                finalize_dropped_redirect(timestamp, request, response);
+            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+                // With --retry-on-error, the captured command bytes are resent
+                // on the slot-owning connection. MOVED/ASK count toward
+                // max_retries. If the retry is refused (budget exhausted /
+                // queue full / no captured bytes), account it as a terminal
+                // error so the request doesn't silently disappear from stats.
                 finalize_dropped_redirect(timestamp, request, response);
             }
             return;
@@ -531,7 +786,21 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
             handle_ask(conn_id, timestamp, request, response);
-            if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            if (m_config->transaction && (int) conn_id == m_txn_pinned_conn_id) {
+                if (!m_txn_pin_lost_warned) {
+                    m_txn_pin_lost_warned = true;
+                    benchmark_error_log("warning: --transaction pin connection (id=%u) received ASK "
+                                        "mid-rotation; topology changed; transaction stats for the "
+                                        "interrupted rotation will be inaccurate.\n",
+                                        conn_id);
+                }
+                txn_release_pin();
+                for (size_t i = 0; i < m_connections.size(); i++) {
+                    if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                        m_connections[i]->schedule_fill();
+                }
+                finalize_dropped_redirect(timestamp, request, response);
+            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
                 finalize_dropped_redirect(timestamp, request, response);
             }
             return;

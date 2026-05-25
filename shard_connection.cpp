@@ -72,6 +72,11 @@ void cluster_client_reconnect_timer_handler(evutil_socket_t fd, short what, void
     sc->handle_reconnect_timer_event();
 }
 
+void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->fill_pipeline();
+}
+
 void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -208,7 +213,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_retry_queue(NULL),
         m_replay_queue(NULL),
         m_retry_drain_timer(NULL),
-        m_current_retry_backoff_ms(0.0)
+        m_current_retry_backoff_ms(0.0),
+        m_deferred_fill_timer(NULL)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -287,6 +293,11 @@ shard_connection::~shard_connection()
     if (m_retry_drain_timer != NULL) {
         event_free(m_retry_drain_timer);
         m_retry_drain_timer = NULL;
+    }
+
+    if (m_deferred_fill_timer != NULL) {
+        event_free(m_deferred_fill_timer);
+        m_deferred_fill_timer = NULL;
     }
 
     if (m_retry_queue != NULL) {
@@ -492,6 +503,10 @@ void shard_connection::disconnect()
     } else {
         while (m_pending_resp)
             delete pop_req();
+    }
+
+    if (m_deferred_fill_timer != NULL && evtimer_pending(m_deferred_fill_timer, NULL)) {
+        evtimer_del(m_deferred_fill_timer);
     }
 
     m_connection_state = conn_disconnected;
@@ -950,6 +965,12 @@ void shard_connection::fill_pipeline(void)
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    // Re-enable I/O in case a prior idle period disabled the bufferevent
+    // (e.g. a --transaction non-pin connection that was held by hold_pipeline).
+    if (m_bev != NULL && get_connection_state() == conn_connected) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+    }
+
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
         if (!is_conn_setup_done()) {
             send_conn_setup_commands(now);
@@ -1079,6 +1100,26 @@ void shard_connection::handle_timer_event(void)
     }
 
     fill_pipeline();
+}
+
+void shard_connection::schedule_fill(void)
+{
+    if (m_connection_state != conn_connected || m_bev == NULL) {
+        return;
+    }
+    // Re-enable I/O in case fill_pipeline silenced this connection while it
+    // was blocked by transaction-mode hold_pipeline.
+    bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+    if (m_deferred_fill_timer == NULL) {
+        m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
+        if (m_deferred_fill_timer == NULL) {
+            return;
+        }
+    }
+    if (!evtimer_pending(m_deferred_fill_timer, NULL)) {
+        struct timeval zero = {0, 0};
+        event_add(m_deferred_fill_timer, &zero);
+    }
 }
 
 void shard_connection::attempt_reconnect(const char *error_context)
