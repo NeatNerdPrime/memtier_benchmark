@@ -51,6 +51,7 @@
 #include "shard_connection.h"
 
 #define KEY_INDEX_QUEUE_MAX_SIZE 1000000
+#define STAGED_MONITOR_QUEUE_MAX_SIZE 1000000
 
 #define MOVED_MSG_PREFIX "-MOVED"
 #define MOVED_MSG_PREFIX_LEN 6
@@ -154,8 +155,10 @@ int cluster_client::connect(void)
     if (m_key_index_pools.empty()) {
         key_index_pool *key_idx_pool = new key_index_pool;
         m_key_index_pools.push_back(key_idx_pool);
+        m_staged_monitor_commands.emplace_back();
     }
     assert(m_connections.size() == m_key_index_pools.size());
+    assert(m_connections.size() == m_staged_monitor_commands.size());
 
     // continue with base class
     client::connect();
@@ -194,11 +197,14 @@ void cluster_client::disconnect(void)
         sc->disconnect();
     }
 
-    // delete all connections except main connection
+    // delete all connections except main connection; shrink parallel vectors in lockstep
     for (i = conn_size - 1; i > 0; i--) {
         shard_connection *sc = m_connections.back();
         m_connections.pop_back();
         delete sc;
+        // m_key_index_pools entries are intentionally kept (owned heap objects reused on reconnect)
+        // m_staged_monitor_commands must shrink to match m_connections so indices stay valid
+        m_staged_monitor_commands.pop_back();
     }
 }
 
@@ -214,17 +220,23 @@ shard_connection *cluster_client::create_shard_connection(abstract_protocol *abs
     assert(key_idx_pool != NULL);
 
     m_key_index_pools.push_back(key_idx_pool);
+    m_staged_monitor_commands.emplace_back();
     assert(m_connections.size() == m_key_index_pools.size());
+    assert(m_connections.size() == m_staged_monitor_commands.size());
 
     return sc;
 }
 
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
-    // empty key index queue
+    // empty key index queue and staged monitor commands
     if (m_key_index_pools[sc->get_id()]->size()) {
         key_index_pool empty_queue;
         std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
+    }
+    {
+        std::queue<staged_monitor_cmd> empty_staged;
+        std::swap(m_staged_monitor_commands[sc->get_id()], empty_staged);
     }
 
     // save address and port
@@ -353,9 +365,11 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         return true;
     }
 
-    /* Don't exceed requests. */
+    /* Don't exceed requests — but always drain staged monitor commands even after the limit
+     * is reached, since those were already counted by the routing side. */
     if (m_config->requests) {
-        if (m_key_index_pools[conn_id]->empty() && m_reqs_generated >= m_config->requests) {
+        if (m_key_index_pools[conn_id]->empty() && m_staged_monitor_commands[conn_id].empty() &&
+            m_reqs_generated >= m_config->requests) {
             return true;
         }
     }
@@ -440,6 +454,13 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
     assert(m_key_index_pools[conn_id]->empty());
 
     const arbitrary_command &cmd = get_arbitrary_command(command_index);
+
+    /* --monitor-input in cluster mode: select the command, parse its first key, and route
+     * to the shard that owns that slot. Commands for other shards are staged and that shard
+     * is woken up via schedule_fill(); this connection returns immediately without sending. */
+    if (cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type) {
+        return create_monitor_request_cluster(command_index, timestamp, conn_id);
+    }
 
     /* --transaction: one full rotation of --command entries = one transactional
      * unit (e.g. WATCH/MULTI/.../EXEC). Pin every command in the rotation to a
@@ -612,6 +633,12 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
 
 void cluster_client::create_request(struct timeval timestamp, unsigned int conn_id)
 {
+    /* Drain staged monitor commands that were routed here from another shard connection. */
+    if (!m_staged_monitor_commands[conn_id].empty()) {
+        process_staged_monitor_command(timestamp, conn_id);
+        return;
+    }
+
     /* If pool is empty continue with base class */
     if (m_key_index_pools[conn_id]->empty()) {
         client::create_request(timestamp, conn_id);
@@ -633,6 +660,106 @@ void cluster_client::create_request(struct timeval timestamp, unsigned int conn_
 
     /* Make sure we used pair of command and key index */
     assert(m_key_index_pools[conn_id]->size() == pool_size - 2);
+}
+
+// Send a staged monitor command that was pre-routed to this shard by another connection.
+// parsed_cmd was already split at staging time; we only need to format (RESP-frame) and send.
+void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/, unsigned int conn_id)
+{
+    staged_monitor_cmd staged = std::move(m_staged_monitor_commands[conn_id].front());
+    m_staged_monitor_commands[conn_id].pop();
+
+    // format_arbitrary_command mutates arg->data in-place; call it here at drain time
+    // (not at staging time) so the RESP framing is applied on the correct connection's protocol.
+    if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(staged.parsed_cmd)) {
+        benchmark_error_log("warning: skipping unformattable staged monitor command at line %zu\n",
+                            staged.source_line);
+        return;
+    }
+
+    int cmd_size = 0;
+    for (unsigned int i = 0; i < staged.parsed_cmd.command_args.size(); i++) {
+        const command_arg *arg = &staged.parsed_cmd.command_args[i];
+        if (arg->type == const_type) {
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
+        }
+    }
+    // Use the enqueue timestamp so latency reflects selection→response, not drain→response.
+    m_connections[conn_id]->send_arbitrary_command_end(staged.stats_index, &staged.enqueue_time, cmd_size);
+}
+
+// Select a monitor command, extract its first key to compute the target shard slot, and either
+// send it here (slot belongs to this connection) or stage it for the owning shard connection.
+bool cluster_client::create_monitor_request_cluster(unsigned int command_index, struct timeval &timestamp,
+                                                    unsigned int conn_id)
+{
+    // Select the command from the monitor file.
+    size_t selected_index = 0;
+    std::string raw_cmd;
+    if (m_config->monitor_pattern == 'R') {
+        raw_cmd = m_config->monitor_commands->get_random_command(m_obj_gen, &selected_index);
+    } else {
+        raw_cmd = m_config->monitor_commands->get_next_sequential_command(&selected_index);
+    }
+    size_t stats_index = m_config->monitor_commands->get_stats_index(selected_index);
+
+    // Parse the raw command so we can read the first key *before* format_arbitrary_command
+    // rewrites arg->data with RESP framing.
+    arbitrary_command temp_cmd(raw_cmd.c_str());
+    if (!temp_cmd.split_command_to_args()) {
+        benchmark_error_log("warning: skipping malformed monitor command at line %zu: %s\n", selected_index + 1,
+                            raw_cmd.c_str());
+        return true;
+    }
+
+    // Determine target shard from the first key argument (index 1 = first arg after command name).
+    // Fall back to the current connection if topology isn't ready yet or there is no key.
+    unsigned int target_conn = conn_id;
+    if (temp_cmd.command_args.size() >= 2) {
+        const std::string &key = temp_cmd.command_args[1].data;
+        if (!key.empty()) {
+            uint32_t slot = calc_hslot_crc16_with_hash_tag(key.c_str(), key.size());
+            uint32_t shard = m_slot_to_shard[slot];
+            if (shard < m_connections.size() &&
+                m_connections[shard]->get_connection_state() != conn_disconnected &&
+                m_connections[shard]->get_cluster_slots_state() == setup_done) {
+                target_conn = shard;
+            }
+        }
+    }
+
+    if (target_conn != conn_id) {
+        // Stage the pre-selected, pre-split command for the owning shard and wake it up.
+        // Storing the already-split arbitrary_command avoids re-parsing at drain time.
+        // format_arbitrary_command is intentionally deferred to drain: it mutates arg->data
+        // in-place with RESP framing and must be called per-connection at send time.
+        // Cap the queue to prevent unbounded memory growth under skewed workloads.
+        if (m_staged_monitor_commands[target_conn].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
+            benchmark_debug_log("staged monitor queue for conn %u full, dropping command\n", target_conn);
+            m_stats.inc_error();
+            return true;
+        }
+        staged_monitor_cmd staged{std::move(temp_cmd), stats_index, timestamp, selected_index + 1};
+        m_staged_monitor_commands[target_conn].push(std::move(staged));
+        m_connections[target_conn]->schedule_fill();
+        return true;
+    }
+
+    // The slot belongs to this connection — format and send inline.
+    if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(temp_cmd)) {
+        benchmark_error_log("warning: skipping unformattable monitor command at line %zu\n", selected_index + 1);
+        return true;
+    }
+
+    int cmd_size = 0;
+    for (unsigned int i = 0; i < temp_cmd.command_args.size(); i++) {
+        const command_arg *arg = &temp_cmd.command_args[i];
+        if (arg->type == const_type) {
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
+        }
+    }
+    m_connections[conn_id]->send_arbitrary_command_end(stats_index, &timestamp, cmd_size);
+    return true;
 }
 
 // In case of -MOVED response, we sends CLUSTER SLOTS command to get the new topology
@@ -657,9 +784,13 @@ void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp
     // connection already issued 'cluster slots' command, wait for slots mapping to be updated
     if (m_connections[conn_id]->get_cluster_slots_state() != setup_done) return;
 
-    // queue may stored uncorrected mapping indexes, empty them
+    // flush stale routing entries for this connection's old slot ownership
     key_index_pool empty_queue;
     std::swap(*m_key_index_pools[conn_id], empty_queue);
+    {
+        std::queue<staged_monitor_cmd> empty_staged;
+        std::swap(m_staged_monitor_commands[conn_id], empty_staged);
+    }
 
     // set connection to send 'CLUSTER SLOTS' command
     m_connections[conn_id]->set_cluster_slots();
