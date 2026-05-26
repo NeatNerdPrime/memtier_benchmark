@@ -345,16 +345,21 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
 
     // check if some connections left with no slots, and need to be closed
     for (unsigned int i = 0; i < prev_connections_size; i++) {
-        if ((close_sc[i] == true) && (m_connections[i]->get_connection_state() != conn_disconnected)) {
-            // Flush staged monitor commands before retiring the shard. hold_pipeline()
-            // returns true for disconnected connections, so these entries would never
-            // drain; compensate m_reqs_generated to prevent a --requests hang.
-            if (i < m_staged_monitor_commands.size() && !m_staged_monitor_commands[i].empty()) {
+        if (close_sc[i] == true) {
+            // Flush staged monitor commands unconditionally for any retired shard,
+            // regardless of its connection state. A shard can be already disconnected
+            // (TCP dropped mid-run) while still holding staged commands that were
+            // counted in m_reqs_generated at staging time. hold_pipeline() returns
+            // true for disconnected connections so those entries would never self-drain;
+            // compensate m_reqs_generated now to prevent a --requests hang.
+            if (!m_staged_monitor_commands[i].empty()) {
                 std::queue<staged_monitor_cmd> empty_staged;
                 std::swap(m_staged_monitor_commands[i], empty_staged);
                 m_reqs_generated -= empty_staged.size();
             }
-            m_connections[i]->disconnect();
+            if (m_connections[i]->get_connection_state() != conn_disconnected) {
+                m_connections[i]->disconnect();
+            }
         }
     }
 }
