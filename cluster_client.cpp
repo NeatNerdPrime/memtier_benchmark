@@ -238,6 +238,10 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     {
         std::queue<staged_monitor_cmd> empty_staged;
         std::swap(m_staged_monitor_commands[sc->get_id()], empty_staged);
+        // Commands in the cleared staged queue were already counted in m_reqs_generated at
+        // staging time. Compensate so a --requests run is not left waiting for responses
+        // that will never arrive.
+        m_reqs_generated -= empty_staged.size();
     }
 
     // save address and port
@@ -342,6 +346,14 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // check if some connections left with no slots, and need to be closed
     for (unsigned int i = 0; i < prev_connections_size; i++) {
         if ((close_sc[i] == true) && (m_connections[i]->get_connection_state() != conn_disconnected)) {
+            // Flush staged monitor commands before retiring the shard. hold_pipeline()
+            // returns true for disconnected connections, so these entries would never
+            // drain; compensate m_reqs_generated to prevent a --requests hang.
+            if (i < m_staged_monitor_commands.size() && !m_staged_monitor_commands[i].empty()) {
+                std::queue<staged_monitor_cmd> empty_staged;
+                std::swap(m_staged_monitor_commands[i], empty_staged);
+                m_reqs_generated -= empty_staged.size();
+            }
             m_connections[i]->disconnect();
         }
     }
@@ -773,6 +785,11 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
         }
     }
+    if (cmd_size == 0) {
+        // Defensive: formatted command produced no sendable bytes; nothing was written
+        // to the socket so no response will arrive. Don't count as a generated request.
+        return false;
+    }
     m_connections[conn_id]->send_arbitrary_command_end(stats_index, &timestamp, cmd_size);
     return true;
 }
@@ -805,6 +822,9 @@ void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp
     {
         std::queue<staged_monitor_cmd> empty_staged;
         std::swap(m_staged_monitor_commands[conn_id], empty_staged);
+        // Staged commands were already counted in m_reqs_generated at staging time.
+        // Compensate so a --requests run does not hang waiting for phantom responses.
+        m_reqs_generated -= empty_staged.size();
     }
 
     // set connection to send 'CLUSTER SLOTS' command
