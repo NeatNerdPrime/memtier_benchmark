@@ -146,6 +146,7 @@ struct benchmark_config
     struct monitor_command_list *monitor_commands;
     char monitor_pattern;
     bool command_stats_by_type; // true = aggregate by command type (default), false = per command line
+    bool command_miss_tracking; // true = auto (track misses for known shapes), false = off
     const char *hdr_prefix;
     unsigned int request_rate;
     unsigned int request_per_interval;

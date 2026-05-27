@@ -721,6 +721,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_monitor_input,
         o_monitor_pattern,
         o_command_stats_breakdown,
+        o_command_miss_tracking,
         o_tls,
         o_tls_cert,
         o_tls_key,
@@ -829,6 +830,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"monitor-input", 1, 0, o_monitor_input},
         {"monitor-pattern", 1, 0, o_monitor_pattern},
         {"command-stats-breakdown", 1, 0, o_command_stats_breakdown},
+        {"command-miss-tracking", 1, 0, o_command_miss_tracking},
         {"rate-limiting", 1, 0, o_rate_limiting},
         {"uri", 1, 0, o_uri},
         {"statsd-host", 1, 0, o_statsd_host},
@@ -1315,6 +1317,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 // Regular arbitrary command
                 arbitrary_command cmd(cmd_str);
                 if (cmd.split_command_to_args()) {
+                    // Resolve key positions and reply shape from the static
+                    // command_meta registry (vendored Redis commands.json).
+                    // Memcached / module / unknown commands return spec=null
+                    // and the call is a no-op.
+                    cmd.resolve_command_meta();
                     cfg->arbitrary_commands->add_command(cmd);
                 } else {
                     fprintf(stderr, "error: failed to parse arbitrary command.\n");
@@ -1380,6 +1387,21 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 cfg->command_stats_by_type = false;
             } else {
                 fprintf(stderr, "error: command-stats-breakdown must be 'command' or 'line'.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_command_miss_tracking: {
+            if (!optarg) {
+                fprintf(stderr, "error: command-miss-tracking requires a value: 'auto' or 'off'.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "auto") == 0) {
+                cfg->command_miss_tracking = true;
+            } else if (strcasecmp(optarg, "off") == 0) {
+                cfg->command_miss_tracking = false;
+            } else {
+                fprintf(stderr, "error: command-miss-tracking must be 'auto' or 'off'.\n");
                 return -1;
             }
             break;
@@ -1645,6 +1667,12 @@ void usage()
         "                                 How to group command statistics in the output (default: command)\n"
         "                                 command: aggregate by command name (first word, e.g., SET, GET)\n"
         "                                 line: show each command line separately\n"
+        "      --command-miss-tracking=auto|off\n"
+        "                                 Track per-key cache misses for arbitrary commands (default: auto)\n"
+        "                                 auto: enable for commands with known reply shape (GET, MGET, "
+        "HGET, HMGET, GETEX, EXISTS, ...)\n"
+        "                                 off:  disable; mb.json will not contain per-arbitrary-command "
+        "Hits/Misses fields\n"
         "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
         "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
         "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
@@ -2653,6 +2681,7 @@ int main(int argc, char *argv[])
     // 0 must remain a valid user-specified "disabled" value, so initialize the
     // sentinel before parsing args.
     cfg.max_retries = -1;
+    cfg.command_miss_tracking = true; // Default: auto-track misses for known shapes
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
@@ -2786,7 +2815,20 @@ int main(int argc, char *argv[])
                 cmd.command_type = cmd.command_name;
                 // Append line number to display name for --command-stats-breakdown=line mode
                 cmd.command_name += " (Line " + std::to_string(index) + ")";
+                // Monitor-expanded command: resolve key positions / reply shape from
+                // the static command_meta registry. Skipped silently if memcached
+                // or unknown command.
+                cmd.resolve_command_meta();
             }
+        }
+    }
+
+    // Apply the --command-miss-tracking=off override across the resolved command
+    // list. resolve_command_meta() defaults miss_tracking to on for known shapes;
+    // the explicit "off" CLI value clears it everywhere.
+    if (!cfg.command_miss_tracking) {
+        for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            cfg.arbitrary_commands->at(i).miss_tracking_enabled = false;
         }
     }
 

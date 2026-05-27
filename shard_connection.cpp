@@ -167,8 +167,18 @@ void request::set_key_for_log(const char *key, unsigned int key_len)
 }
 
 arbitrary_request::arbitrary_request(size_t request_index, request_type type, unsigned int size,
-                                     struct timeval *sent_time) :
-        request(type, size, sent_time, 1), index(request_index)
+                                     struct timeval *sent_time, const arbitrary_command *cmd_meta) :
+        request(type, size, sent_time,
+                // m_keys is the number of expected key buckets. Prefer the
+                // spec-resolved positions when available so per-key totals match
+                // what the parser will see; otherwise fall back to the user's
+                // __key__ placeholder count, then 1 as a conservative default.
+                (cmd_meta != NULL && !cmd_meta->spec_key_positions.empty())
+                    ? (unsigned int) cmd_meta->spec_key_positions.size()
+                : (cmd_meta != NULL && cmd_meta->keys_count > 0) ? cmd_meta->keys_count
+                                                                 : 1),
+        index(request_index),
+        m_cmd_meta(cmd_meta)
 {
 }
 
@@ -1363,7 +1373,13 @@ int shard_connection::send_arbitrary_command(const command_arg *arg, const char 
 
 void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size)
 {
-    arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time);
+    // Look up the source command's metadata so the reply handler can route
+    // per-key miss accounting. Safe to be NULL (we tolerate it downstream).
+    const arbitrary_command *meta = NULL;
+    if (m_config && m_config->arbitrary_commands && command_index < m_config->arbitrary_commands->size()) {
+        meta = &m_config->arbitrary_commands->at(command_index);
+    }
+    arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time, meta);
     if (m_config->retry_on_error && m_bev && cmd_size > 0) {
         // Bytes were written across N calls to send_arbitrary_command; use
         // cmd_size to recover the start offset.

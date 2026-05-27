@@ -85,6 +85,29 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
+    // Enable value keeping for arbitrary-command miss tracking when any
+    // configured command needs reply-array inspection (ArrayPerElementNulls or
+    // EmptyCollection). SingleNullBulk and IntegerMembership use the parser's
+    // existing scalar counters so no materialization is required for them.
+    if (config->arbitrary_commands->is_defined()) {
+        bool needs_array_walk = false;
+        for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
+            const arbitrary_command &cmd = config->arbitrary_commands->at(i);
+            if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
+            using memtier::command_meta::ReplyShape;
+            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
+                cmd.spec->reply_shape == ReplyShape::EmptyCollection) {
+                needs_array_walk = true;
+                break;
+            }
+        }
+        if (needs_array_walk) {
+            for (size_t i = 0; i < m_connections.size(); ++i) {
+                m_connections[i]->get_protocol()->set_keep_value(true);
+            }
+        }
+    }
+
     // Parallel key-pattern determined according to the first command
     if ((config->arbitrary_commands->is_defined() && config->arbitrary_commands->at(0).key_pattern == 'P') ||
         (config->key_pattern[key_pattern_set] == 'P')) {
@@ -733,6 +756,164 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         arbitrary_request *ar = static_cast<arbitrary_request *>(request);
         m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
                                     ts_diff(ref_sent, timestamp), ar->index);
+
+        // Per-key miss accounting. Only fires when:
+        //   1. the command resolved to a registry entry (spec != NULL)
+        //   2. miss tracking wasn't disabled by --command-miss-tracking=off
+        //   3. the reply isn't an error (errors are recorded separately by the
+        //      protocol layer; counting them as misses would double-book).
+        if (ar->m_cmd_meta != NULL && ar->m_cmd_meta->miss_tracking_enabled && ar->m_cmd_meta->spec != NULL &&
+            !response->is_error()) {
+            unsigned int num_keys = request->m_keys;
+            unsigned int hits = 0;
+            unsigned int misses = 0;
+            // Each case allocates per_key_hit at the right size once. Avoiding
+            // a pre-resize here means SingleNullBulk pays only for a 1-bucket
+            // vector and ArrayPerElementNulls pays for one assign() instead of
+            // a resize-then-assign pair on the hot reply path.
+            std::vector<bool> per_key_hit;
+
+            using memtier::command_meta::ReplyShape;
+            switch (ar->m_cmd_meta->spec->reply_shape) {
+            case ReplyShape::SingleNullBulk: {
+                // Hit iff the top-level reply isn't a null sentinel. We can't
+                // use response->get_hits() here: the parser increments it for
+                // every non-null bulk it walks, which overcounts for blocking
+                // pop commands (BLPOP/BRPOP/BZPOPMAX/BZPOPMIN return [key,
+                // value] arrays on success — get_hits() returns 2) and for
+                // multi-element pops (LPOP key COUNT N returns an N-element
+                // array). The status line carries the top-level RESP type
+                // header, which is what we actually care about: $-1 (null
+                // bulk), *-1 (null array), or anything else (a value).
+                const char *status = response->get_status();
+                // Miss sentinels: $-1 (null bulk), *-1 (null array, RESP2),
+                // and *0 (empty array - returned by SPOP/SRANDMEMBER with a
+                // count argument when the key is absent). Anything else is
+                // a value (or a non-empty container) and counts as a hit.
+                bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0 ||
+                                                   strcmp(status, "*0") == 0));
+                // Always one bucket for SingleNullBulk: variadic-key blocking
+                // commands like BLPOP carry the winning key in the reply but
+                // we don't parse it, so per-key attribution beyond hit/miss
+                // isn't available.
+                per_key_hit.assign(1, false);
+                num_keys = 1;
+                hits = is_null ? 0 : 1;
+                misses = is_null ? 1 : 0;
+                if (!is_null) per_key_hit[0] = true;
+                break;
+            }
+            case ReplyShape::ArrayPerElementNulls: {
+                // Walk the top-level mbulk array. Bucket count is the reply
+                // element count, not the spec key count: HMGET / ZMSCORE
+                // have 1 Redis key but produce one reply element per
+                // field/member, so capping to num_keys (==1) would lose all
+                // but the first position. MGET (multi-key spec) naturally
+                // matches reply size 1:1.
+                mbulk_size_el *top = response->get_mbulk_value();
+                if (top != NULL) {
+                    size_t n = top->mbulks_elements.size();
+                    per_key_hit.assign(n, false);
+                    num_keys = (unsigned int) n;
+                    for (size_t i = 0; i < n; ++i) {
+                        mbulk_element *el = top->mbulks_elements[i];
+                        bool h = false;
+                        if (el != NULL) {
+                            // ArrayPerElementNulls covers two reply shapes:
+                            //   - array of (bulk | null bulk): MGET, HMGET,
+                            //     ZMSCORE. Null bulk ($-1) materializes as a
+                            //     bulk_el with value==NULL/value_len==0.
+                            //   - array of (nested-array | null array):
+                            //     GEOPOS, COMMAND INFO, SORT_RO. Null array
+                            //     (*-1) materializes as an mbulk_size_el with
+                            //     no children (indistinguishable from *0,
+                            //     which is also "no value here" in practice).
+                            // is_bulk()/is_mbulk_size() avoid the assert that
+                            // as_bulk()/as_mbulk_size() raise on the wrong
+                            // kind.
+                            if (el->is_bulk()) {
+                                bulk_el *bel = el->as_bulk();
+                                // Hit = the bulk slot carries a value. Use
+                                // value!=NULL (the parser zero-allocates the
+                                // pointer only for $-1 null bulks) so that
+                                // empty-string values ($0\r\n\r\n) count as
+                                // hits when the parser is later extended to
+                                // preserve them. Today the redis_protocol
+                                // parser collapses $0 and $-1 into the same
+                                // representation (value=NULL, value_len=0),
+                                // matching the existing GET path's m_hits
+                                // convention; the value-pointer check is the
+                                // semantically correct one and is forward-
+                                // compatible with a parser that distinguishes.
+                                if (bel != NULL && bel->value != NULL) {
+                                    h = true;
+                                }
+                            } else if (el->is_mbulk_size()) {
+                                mbulk_size_el *sub = el->as_mbulk_size();
+                                if (sub != NULL && !sub->mbulks_elements.empty()) {
+                                    h = true;
+                                }
+                            }
+                        }
+                        per_key_hit[i] = h;
+                        if (h) hits++;
+                    }
+                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
+                } else {
+                    // Top-level reply isn't an mbulk (could be +OK, -ERR, a
+                    // single bulk for a misshape, or any non-array reply).
+                    // Account uniformly: a single miss bucket so per-key and
+                    // aggregate counters stay in sync.
+                    per_key_hit.assign(1, false);
+                    num_keys = 1;
+                    misses = 1;
+                }
+                break;
+            }
+            case ReplyShape::EmptyCollection: {
+                // Heuristic: empty array == missing key. EmptyCollection
+                // commands (SMEMBERS, LRANGE, HGETALL, ...) virtually always
+                // carry exactly 1 key.
+                mbulk_size_el *top = response->get_mbulk_value();
+                bool empty = (top == NULL || top->mbulks_elements.empty());
+                per_key_hit.assign(num_keys, !empty);
+                hits = empty ? 0 : num_keys;
+                misses = empty ? num_keys : 0;
+                break;
+            }
+            case ReplyShape::IntegerMembership: {
+                // Reply is ":N\r\n" where N is the count of present keys.
+                // Per-position attribution is impossible from this reply, so
+                // we mark the first N buckets as hits and the rest as misses;
+                // the aggregate is correct, the per-position is conventional.
+                const char *status = response->get_status();
+                unsigned int n = 0;
+                if (status != NULL && status[0] == ':') {
+                    long v = strtol(status + 1, NULL, 10);
+                    if (v > 0) n = (unsigned int) v;
+                }
+                if (n > num_keys) n = num_keys;
+                hits = n;
+                misses = num_keys - n;
+                per_key_hit.assign(num_keys, false);
+                for (unsigned int i = 0; i < hits; ++i)
+                    per_key_hit[i] = true;
+                break;
+            }
+            default:
+                // Unreachable today: miss_tracking_enabled is only set for the
+                // four miss-bearing shapes above. Skip the stats call entirely
+                // here so a future shape addition doesn't silently record
+                // zero-valued hits/misses with an empty per_key_hit; the build
+                // will fail to compile (missing case label) only if -Wswitch
+                // catches it, so the guard makes the intent explicit.
+                break;
+            }
+
+            if (!per_key_hit.empty()) {
+                m_stats.update_arbitrary_op_misses(ar->index, hits, misses, per_key_hit);
+            }
+        }
 
         // Extract cursor from SCAN response for incremental iteration
         if (m_config->scan_incremental_iteration && !response->is_error()) {

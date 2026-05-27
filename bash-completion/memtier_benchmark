@@ -106,6 +106,12 @@ _memtier_completions()
     "--command-stats-breakdown")
       all_options="command line"
     ;;
+    "--command-miss-tracking=")
+      cur=${cur#"--command-miss-tracking="}
+    ;&
+    "--command-miss-tracking")
+      all_options="auto off"
+    ;;
     "--key-pattern=")
       cur=${cur#"--key-pattern="}
     ;&

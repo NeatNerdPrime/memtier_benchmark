@@ -140,6 +140,11 @@ void run_stats::setup_arbitrary_commands(size_t n_arbitrary_commands)
     m_cur_stats.setup_arbitrary_commands(n_arbitrary_commands);
     m_ar_commands_latency_histograms.resize(n_arbitrary_commands);
     inst_m_ar_commands_latency_histograms.resize(n_arbitrary_commands);
+
+    // Pre-size the per-command miss totals; per-key vectors are allocated
+    // lazily on first update_arbitrary_op_misses() call (we don't know each
+    // command's key count from here without coupling run_stats to the config).
+    m_arbitrary_misses.assign(n_arbitrary_commands, arbitrary_misses_total());
 }
 
 void run_stats::set_start_time(struct timeval *start_time)
@@ -348,6 +353,42 @@ void run_stats::update_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, u
     hdr_record_value_capped(inst_hist, latency);
     hdr_record_value_capped(m_totals_latency_histogram, latency);
     hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+}
+
+void run_stats::update_arbitrary_op_misses(size_t arbitrary_index, unsigned int hits, unsigned int misses,
+                                           const std::vector<bool> &per_key_hit)
+{
+    if (arbitrary_index >= m_arbitrary_misses.size()) return;
+
+    arbitrary_misses_total &t = m_arbitrary_misses[arbitrary_index];
+    t.total_hits += hits;
+    t.total_misses += misses;
+
+    // Per-key vector sizing: grow-only. ArrayPerElementNulls commands like
+    // HMGET / ZMSCORE produce a variable reply length per call (depends on
+    // how many fields/members were queried), so the bucket count is not
+    // necessarily stable across calls. resize() preserves already-accumulated
+    // counters; an assign()-on-mismatch would silently zero them out.
+    if (!per_key_hit.empty()) {
+        if (t.per_key_hits.size() < per_key_hit.size()) {
+            t.per_key_hits.resize(per_key_hit.size(), 0);
+            t.per_key_misses.resize(per_key_hit.size(), 0);
+        }
+        for (size_t i = 0; i < per_key_hit.size(); ++i) {
+            if (per_key_hit[i]) {
+                t.per_key_hits[i]++;
+            } else {
+                t.per_key_misses[i]++;
+            }
+        }
+    }
+
+    // Mirror aggregate hits/misses into the per-second slot so the existing
+    // CSV/per-second JSON time series picks them up. Latency was already
+    // recorded by the prior update_arbitrary_op() call.
+    one_sec_cmd_stats &slot = m_cur_stats.m_ar_commands.at(arbitrary_index);
+    slot.m_hits += hits;
+    slot.m_misses += misses;
 }
 
 unsigned int run_stats::get_duration(void)
@@ -868,6 +909,27 @@ void run_stats::merge(const run_stats &other, int iteration)
 
     for (unsigned int j = 0; j < other.m_ar_commands_latency_histograms.size(); j++) {
         hdr_add(m_ar_commands_latency_histograms.at(j), other.m_ar_commands_latency_histograms.at(j));
+    }
+
+    // Merge per-arbitrary-command miss totals from the other run_stats.
+    if (m_arbitrary_misses.size() < other.m_arbitrary_misses.size()) {
+        m_arbitrary_misses.resize(other.m_arbitrary_misses.size());
+    }
+    for (size_t j = 0; j < other.m_arbitrary_misses.size(); ++j) {
+        const arbitrary_misses_total &src = other.m_arbitrary_misses[j];
+        arbitrary_misses_total &dst = m_arbitrary_misses[j];
+        dst.total_hits += src.total_hits;
+        dst.total_misses += src.total_misses;
+        if (!src.per_key_hits.empty()) {
+            if (dst.per_key_hits.size() < src.per_key_hits.size()) {
+                dst.per_key_hits.resize(src.per_key_hits.size(), 0);
+                dst.per_key_misses.resize(src.per_key_hits.size(), 0);
+            }
+            for (size_t k = 0; k < src.per_key_hits.size(); ++k) {
+                dst.per_key_hits[k] += src.per_key_hits[k];
+                dst.per_key_misses[k] += src.per_key_misses[k];
+            }
+        }
     }
 }
 
@@ -1433,18 +1495,33 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     std::vector<unsigned int> timestamps = get_one_sec_cmd_stats_timestamp();
 
     if (print_arbitrary_commands_results()) {
+        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
         if (aggregated != nullptr) {
-            // Use aggregated stats by command type
+            // Use aggregated stats by command type. Sum hits/misses across the
+            // member command indices so the displayed Hits/sec for "Gets"
+            // reflects all GET-shaped --command lines combined.
             for (const auto &agg : *aggregated) {
                 std::string command_name = agg.command_type;
                 std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::tolower);
                 command_name[0] = static_cast<char>(toupper(command_name[0]));
                 command_name.append("s");
 
-                // Compute proper weighted average latency from histogram (not sum of averages)
                 double avg_latency = hdr_mean(agg.latency_hist) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
 
-                result_print_to_json(jsonhandler, command_name.c_str(), agg.stats.m_ops_sec, 0.0, 0.0,
+                unsigned long long sum_hits = 0;
+                unsigned long long sum_misses = 0;
+                for (size_t idx : agg.command_indices) {
+                    if (idx < m_arbitrary_misses.size()) {
+                        sum_hits += m_arbitrary_misses[idx].total_hits;
+                        sum_misses += m_arbitrary_misses[idx].total_misses;
+                    }
+                }
+                double hits_sec =
+                    test_duration_usec > 0 ? (double) sum_hits / (double) test_duration_usec * 1000000.0 : 0.0;
+                double misses_sec =
+                    test_duration_usec > 0 ? (double) sum_misses / (double) test_duration_usec * 1000000.0 : 0.0;
+
+                result_print_to_json(jsonhandler, command_name.c_str(), agg.stats.m_ops_sec, hits_sec, misses_sec,
                                      cluster_mode ? agg.stats.m_moved_sec : -1, cluster_mode ? agg.stats.m_ask_sec : -1,
                                      agg.stats.m_bytes_sec, agg.stats.m_bytes_sec_rx, agg.stats.m_bytes_sec_tx,
                                      avg_latency, agg.stats.m_total_latency, agg.stats.m_ops,
@@ -1462,8 +1539,15 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 struct hdr_histogram *arbitrary_command_latency_histogram = m_ar_commands_latency_histograms.at(i);
                 std::vector<one_sec_cmd_stats> arbitrary_command_stats = get_one_sec_cmd_stats_arbitrary_command(i);
 
-                result_print_to_json(jsonhandler, command_name.c_str(), m_totals.m_ar_commands[i].m_ops_sec, 0.0, 0.0,
-                                     cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
+                double hits_sec = 0.0;
+                double misses_sec = 0.0;
+                if (i < m_arbitrary_misses.size() && test_duration_usec > 0) {
+                    hits_sec = (double) m_arbitrary_misses[i].total_hits / (double) test_duration_usec * 1000000.0;
+                    misses_sec = (double) m_arbitrary_misses[i].total_misses / (double) test_duration_usec * 1000000.0;
+                }
+
+                result_print_to_json(jsonhandler, command_name.c_str(), m_totals.m_ar_commands[i].m_ops_sec, hits_sec,
+                                     misses_sec, cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
                                      cluster_mode ? m_totals.m_ar_commands[i].m_ask_sec : -1,
                                      m_totals.m_ar_commands[i].m_bytes_sec, m_totals.m_ar_commands[i].m_bytes_sec_rx,
                                      m_totals.m_ar_commands[i].m_bytes_sec_tx, m_totals.m_ar_commands[i].m_latency,
@@ -1473,6 +1557,38 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                                      quantiles_list, arbitrary_command_latency_histogram, timestamps,
                                      arbitrary_command_stats);
             }
+        }
+
+        // Per-key miss buckets, one nesting per command, emitted regardless of
+        // aggregation mode. Only emitted when we actually collected per-position
+        // info (ArrayPerElementNulls / SingleNullBulk / EmptyCollection /
+        // IntegerMembership).
+        bool any_per_key = false;
+        for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
+            if (!m_arbitrary_misses[i].per_key_hits.empty()) {
+                any_per_key = true;
+                break;
+            }
+        }
+        if (any_per_key && jsonhandler != NULL) {
+            jsonhandler->open_nesting("Per-Key Misses");
+            for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
+                const arbitrary_misses_total &t = m_arbitrary_misses[i];
+                if (t.per_key_hits.empty()) continue;
+                if (i >= command_list.size()) continue;
+                jsonhandler->open_nesting(command_list[i].command_name.c_str());
+                jsonhandler->write_obj("Total Hits", "%llu", t.total_hits);
+                jsonhandler->write_obj("Total Misses", "%llu", t.total_misses);
+                for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
+                    char label[32];
+                    snprintf(label, sizeof(label), "key[%zu] Hits", k);
+                    jsonhandler->write_obj(label, "%llu", t.per_key_hits[k]);
+                    snprintf(label, sizeof(label), "key[%zu] Misses", k);
+                    jsonhandler->write_obj(label, "%llu", t.per_key_misses[k]);
+                }
+                jsonhandler->close_nesting();
+            }
+            jsonhandler->close_nesting();
         }
     } else {
         std::vector<one_sec_cmd_stats> get_stats = get_one_sec_cmd_stats_get();

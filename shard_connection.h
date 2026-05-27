@@ -35,6 +35,7 @@ class connections_manager;
 struct benchmark_config;
 class abstract_protocol;
 class object_generator;
+struct arbitrary_command;
 
 enum connection_state
 {
@@ -101,8 +102,14 @@ struct request
 struct arbitrary_request : public request
 {
     size_t index;
+    // Nullable pointer to the source command's metadata (NULL for memcached
+    // and any path where lookup is unavailable). When non-null and
+    // miss_tracking_enabled is true, the response handler walks the reply to
+    // record hits/misses per key bucket.
+    const arbitrary_command *m_cmd_meta;
 
-    arbitrary_request(size_t request_index, request_type type, unsigned int size, struct timeval *sent_time);
+    arbitrary_request(size_t request_index, request_type type, unsigned int size, struct timeval *sent_time,
+                      const arbitrary_command *cmd_meta = NULL);
     virtual ~arbitrary_request(void) {}
 };
 
