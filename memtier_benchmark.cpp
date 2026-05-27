@@ -2695,12 +2695,6 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        // Monitor input only works with single endpoint (not cluster mode)
-        if (cfg.cluster_mode) {
-            fprintf(stderr, "error: --monitor-input is not supported in cluster mode.\n");
-            exit(1);
-        }
-
         if (!cfg.monitor_commands->load_from_file(cfg.monitor_input)) {
             exit(1);
         }
