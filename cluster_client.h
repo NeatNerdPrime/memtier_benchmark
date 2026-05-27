@@ -26,11 +26,12 @@
 
 typedef std::queue<unsigned long long> key_index_pool;
 
-struct staged_monitor_cmd {
+struct staged_monitor_cmd
+{
     arbitrary_command parsed_cmd; // already split (split_command_to_args done); format at drain
     size_t stats_index;
     struct timeval enqueue_time; // latency measured from selection, not drain
-    size_t source_line;         // original monitor file line (1-based) for error messages
+    size_t source_line;          // original monitor file line (1-based) for error messages
 };
 
 // forward decleration
@@ -40,7 +41,7 @@ class cluster_client : public client
 {
 protected:
     std::vector<key_index_pool *> m_key_index_pools;
-    std::vector<std::queue<staged_monitor_cmd>> m_staged_monitor_commands;
+    std::vector<std::queue<staged_monitor_cmd> > m_staged_monitor_commands;
     unsigned int m_slot_to_shard[16384];
     // --transaction: shard connection that owns the in-flight rotation of
     // --command entries. -1 = no pin (rotation has not started or just ended).

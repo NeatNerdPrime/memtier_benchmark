@@ -690,8 +690,7 @@ void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/
     // format_arbitrary_command mutates arg->data in-place; call it here at drain time
     // (not at staging time) so the RESP framing is applied on the correct connection's protocol.
     if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(staged.parsed_cmd)) {
-        benchmark_error_log("warning: skipping unformattable staged monitor command at line %zu\n",
-                            staged.source_line);
+        benchmark_error_log("warning: skipping unformattable staged monitor command at line %zu\n", staged.source_line);
         // m_reqs_generated was incremented when this command was staged. Undo it now so
         // a --requests run doesn't hang waiting for a response that will never arrive.
         m_reqs_generated--;
@@ -749,8 +748,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         if (!key.empty()) {
             uint32_t slot = calc_hslot_crc16_with_hash_tag(key.c_str(), key.size());
             uint32_t shard = m_slot_to_shard[slot];
-            if (shard < m_connections.size() &&
-                m_connections[shard]->get_connection_state() != conn_disconnected &&
+            if (shard < m_connections.size() && m_connections[shard]->get_connection_state() != conn_disconnected &&
                 m_connections[shard]->get_cluster_slots_state() == setup_done) {
                 target_conn = shard;
             }
