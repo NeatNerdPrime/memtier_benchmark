@@ -467,6 +467,34 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    /* Backpressure for --monitor-input cluster replay.
+     *
+     * The route-then-stage design lets a routing connection fan commands out
+     * into *other* shards' staged queues (m_staged_monitor_commands) without
+     * growing its own m_pipeline. fill_pipeline's `m_pipeline->size() < pipeline`
+     * gate therefore never throttles the producer: the routing side keeps
+     * selecting and staging, bounded only by the rate limiter, while each target
+     * drains at most ~pipeline-per-RTT. The staged queues grow without bound, so
+     * reported latency (measured from selection) climbs monotonically as queue
+     * residence dominates the tail, and throughput overshoots the rate target.
+     *
+     * Couple production to drain by capping the global end-to-end in-flight
+     * count — staged + sent-awaiting-response, which equals
+     * (m_reqs_generated - m_reqs_processed) — at pipeline * connection_count, the
+     * same total depth a non-staged run would sustain. A connection that still
+     * has its own staged (or pooled) commands to drain is never held here, so
+     * draining and therefore forward progress is never blocked; only pure
+     * producers pause until responses bring the backlog back under budget. */
+    if (m_config->monitor_input != NULL && m_staged_monitor_commands[conn_id].empty() &&
+        m_key_index_pools[conn_id]->empty()) {
+        const unsigned long long in_flight = m_reqs_generated - m_reqs_processed;
+        const unsigned long long in_flight_budget =
+            (unsigned long long) m_config->pipeline * (unsigned long long) m_connections.size();
+        if (in_flight >= in_flight_budget) {
+            return true;
+        }
+    }
+
     /* In GET-only MGET mode, a connection whose slots own no keys in the
      * configured key range can never generate a request.  Returning true here
      * breaks the fill_pipeline while-loop for that connection so it does not
