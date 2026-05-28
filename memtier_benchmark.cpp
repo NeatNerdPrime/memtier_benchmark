@@ -561,6 +561,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
 
 static void config_init_defaults(struct benchmark_config *cfg)
 {
+    cfg->mget_cache = NULL;
     if (!cfg->server && !cfg->unix_socket) cfg->server = "localhost";
     if (!cfg->port && !cfg->unix_socket) cfg->port = 6379;
     if (!cfg->resolution) cfg->resolution = AF_UNSPEC;
@@ -615,9 +616,6 @@ static bool verify_cluster_option(struct benchmark_config *cfg)
 {
     if (cfg->reconnect_interval) {
         fprintf(stderr, "error: cluster mode dose not support reconnect-interval option.\n");
-        return false;
-    } else if (cfg->multi_key_get) {
-        fprintf(stderr, "error: cluster mode dose not support multi-key-get option.\n");
         return false;
     } else if (cfg->wait_ratio.is_defined()) {
         fprintf(stderr, "error: cluster mode dose not support wait-ratio option.\n");
@@ -1252,7 +1250,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_multi_key_get:
             endptr = NULL;
             cfg->multi_key_get = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (cfg->multi_key_get <= 0 || !endptr || *endptr != '\0') {
+            if (cfg->multi_key_get < 1 || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: multi-key-get must be greater than zero.\n");
                 return -1;
             }
@@ -1724,7 +1722,9 @@ void usage()
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
         "(default: 0)\n"
-        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0)\n"
+        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0).\n"
+        "                                 In cluster mode, keys are probed from the key space so that all\n"
+        "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"
         "      --distinct-client-seed     Use a different random seed for each client\n"
         "      --randomize                random seed based on timestamp (default is constant value)\n"
@@ -2117,6 +2117,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 {
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
 
+    // Shared MGET slot cache: allocate fresh for this run so the lazy build
+    // inside build_mget_slot_cache() fires again (topology may have changed).
+    if (cfg->cluster_mode && cfg->multi_key_get > 0) {
+        delete cfg->mget_cache;
+        cfg->mget_cache = new mget_slot_cache();
+    }
+
     // prepare threads data
     std::vector<cg_thread *> threads;
     g_threads = &threads; // Set global pointer for crash handler
@@ -2127,6 +2134,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         if (t->prepare() < 0) {
             benchmark_error_log("error: failed to prepare thread %u for test.\n", i);
+            delete cfg->mget_cache;
+            cfg->mget_cache = NULL;
             exit(1);
         }
         threads.push_back(t);
@@ -2561,6 +2570,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     }
 
     g_threads = NULL; // Clear global pointer
+
+    delete cfg->mget_cache;
+    cfg->mget_cache = NULL;
 
     return stats;
 }
@@ -3194,6 +3206,14 @@ int main(int argc, char *argv[])
 
     if (cfg.select_db > 0 && !is_redis_protocol(cfg.protocol)) {
         fprintf(stderr, "error: select-db can only be used with redis protocol.\n");
+        usage();
+    }
+    if (cfg.multi_key_get > 0 && cfg.protocol == PROTOCOL_MEMCACHE_BINARY) {
+        fprintf(stderr, "error: --multi-key-get is not supported with memcache_binary.\n");
+        usage();
+    }
+    if (cfg.multi_key_get > 0 && cfg.arbitrary_commands->is_defined()) {
+        fprintf(stderr, "error: --multi-key-get cannot be combined with --command.\n");
         usage();
     }
     if (cfg.data_offset > 0) {

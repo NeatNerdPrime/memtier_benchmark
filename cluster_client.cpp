@@ -279,6 +279,68 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     return res == 0;
 }
 
+void cluster_client::build_mget_slot_cache()
+{
+    if (!m_config->multi_key_get) return;
+
+    mget_slot_cache *cache = m_config->mget_cache;
+    assert(cache != NULL);
+
+    unsigned int num_conns = (unsigned int) m_connections.size();
+
+    // Slot→key mapping is topology-independent: build it once across all threads.
+    pthread_mutex_lock(&cache->mutex);
+    if (!cache->built.load(std::memory_order_relaxed)) {
+        unsigned long long key_min = m_config->key_minimum;
+        unsigned long long key_max = m_config->key_maximum;
+
+        // Cap per-slot storage: multi_key_get * 4, bounded to [multi_key_get, 4096].
+        // This bounds both memory and scan time regardless of key range size.
+        unsigned int cap = (unsigned int) m_config->multi_key_get * 4;
+        if (cap > 4096) cap = 4096;
+        if (cap < (unsigned int) m_config->multi_key_get) cap = (unsigned int) m_config->multi_key_get;
+
+        benchmark_error_log("Building MGET slot cache for key range [%llu, %llu] "
+                            "(cap %u keys/slot)...\n",
+                            key_min, key_max, cap);
+
+        cache->slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
+
+        unsigned int filled_slots = 0;
+        for (unsigned long long idx = key_min; idx <= key_max && filled_slots < MAX_CLUSTER_HSLOT + 1; idx++) {
+            m_obj_gen->generate_key(idx);
+            unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+            if (cache->slot_keys[slot].size() < cap) {
+                cache->slot_keys[slot].push_back(idx);
+                if (cache->slot_keys[slot].size() == cap) filled_slots++;
+            }
+        }
+
+        cache->built.store(true, std::memory_order_release);
+
+        // Count slots that ended up with at least one key (informational).
+        unsigned int populated = 0;
+        for (unsigned int s = 0; s <= MAX_CLUSTER_HSLOT; s++) {
+            if (!cache->slot_keys[s].empty()) populated++;
+        }
+        benchmark_error_log("MGET slot cache built: %u/%u slots populated.\n", populated, MAX_CLUSTER_HSLOT + 1);
+    }
+    pthread_mutex_unlock(&cache->mutex);
+
+    // Per-thread cursor: one entry per slot, sized to match the shared table.
+    m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
+
+    // Conn→slot mapping depends on topology: rebuild on every refresh.
+    m_mget_conn_slots.assign(num_conns, std::vector<unsigned int>());
+    m_mget_conn_slot_cursor.assign(num_conns, 0);
+
+    for (unsigned int slot = 0; slot <= MAX_CLUSTER_HSLOT; slot++) {
+        if (cache->slot_keys[slot].empty()) continue;
+        unsigned int cid = m_slot_to_shard[slot];
+        if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
+    }
+}
+
 void cluster_client::handle_cluster_slots(protocol_response *r)
 {
     /*
@@ -362,6 +424,19 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             }
         }
     }
+
+    // Rebuild same-slot key index cache for MGET if enabled.
+    build_mget_slot_cache();
+
+    // Wake all connected shard connections so each one re-evaluates hold_pipeline()
+    // with the freshly-built m_mget_conn_slots.  Without this, a connection that
+    // was bufferevent_disable()'d before the cache existed would never re-run
+    // fill_pipeline() and would stay permanently idle.
+    if (m_config->multi_key_get > 0) {
+        for (size_t i = 0; i < m_connections.size(); i++) {
+            if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
+        }
+    }
 }
 
 bool cluster_client::hold_pipeline(unsigned int conn_id)
@@ -390,6 +465,17 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
             m_reqs_generated >= m_config->requests) {
             return true;
         }
+    }
+
+    /* In GET-only MGET mode, a connection whose slots own no keys in the
+     * configured key range can never generate a request.  Returning true here
+     * breaks the fill_pipeline while-loop for that connection so it does not
+     * spin consuming CPU.  Other connections (which do have eligible slots)
+     * continue to operate normally. */
+    if (m_config->multi_key_get > 0 && m_config->ratio.a == 0 && m_config->mget_cache != NULL &&
+        m_config->mget_cache->built.load(std::memory_order_acquire) && conn_id < m_mget_conn_slots.size() &&
+        m_mget_conn_slots[conn_id].empty() && m_staged_monitor_commands[conn_id].empty()) {
+        return true;
     }
 
     /* In transaction mode the pin connection drives the entire rotation.
@@ -646,6 +732,42 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
     m_key_index_pools[conn_id]->push(key_index);
     client::create_arbitrary_request(command_index, timestamp, conn_id);
 
+    return true;
+}
+
+bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int conn_id)
+{
+    // Only reached when --multi-key-get is set.
+    // Use the pre-built slot cache so all N keys in this MGET share one hash
+    // slot — Redis requires exact same-slot (not just same-node) for MGET in
+    // cluster mode. Cache is rebuilt on every topology change via
+    // build_mget_slot_cache() at the end of handle_cluster_slots().
+    unsigned int keys_count = m_config->ratio.b - m_get_ratio_count;
+    if ((int) keys_count > m_config->multi_key_get) keys_count = m_config->multi_key_get;
+    if (keys_count == 0) return false;
+
+    if (conn_id >= m_mget_conn_slots.size() || m_mget_conn_slots[conn_id].empty()) {
+        // Cache not ready or no key in the configured range maps to this shard.
+        return false;
+    }
+
+    // Round-robin over the slots owned by this connection.
+    size_t &sc = m_mget_conn_slot_cursor[conn_id];
+    unsigned int target_slot = m_mget_conn_slots[conn_id][sc % m_mget_conn_slots[conn_id].size()];
+    sc++;
+
+    std::vector<unsigned long long> &slot_keys = m_config->mget_cache->slot_keys[target_slot];
+    size_t &kc = m_mget_slot_cursor[target_slot];
+
+    m_keylist->clear();
+    for (unsigned int i = 0; i < keys_count; i++) {
+        unsigned long long idx = slot_keys[kc % slot_keys.size()];
+        kc++;
+        m_obj_gen->generate_key(idx);
+        m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+    }
+
+    m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
     return true;
 }
 

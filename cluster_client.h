@@ -22,6 +22,7 @@
 #include <set>
 #include <queue>
 #include <string>
+#include <vector>
 #include "client.h"
 
 typedef std::queue<unsigned long long> key_index_pool;
@@ -58,6 +59,15 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
+    // Per-slot key index cache for cluster MGET. The slot→key table
+    // (slot_keys) is shared across threads via m_config->mget_cache and is
+    // read-only after the first thread builds it.  Only the per-slot
+    // round-robin cursor (m_mget_slot_cursor) and the per-connection slot
+    // list (m_mget_conn_slots) are per-thread.
+    std::vector<size_t> m_mget_slot_cursor;                    // [slot] → per-thread round-robin cursor
+    std::vector<std::vector<unsigned int> > m_mget_conn_slots; // [conn] → owned slot list
+    std::vector<size_t> m_mget_conn_slot_cursor;               // [conn] → slot round-robin cursor
+    void build_mget_slot_cache();
 
     virtual int connect(void);
     virtual void disconnect(void);
@@ -89,6 +99,7 @@ public:
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
+    virtual bool create_mget_request(struct timeval &timestamp, unsigned int conn_id);
 
     // client manager api's
     virtual void handle_cluster_slots(protocol_response *r);

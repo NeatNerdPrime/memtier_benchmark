@@ -585,11 +585,12 @@ bool client::create_mget_request(struct timeval &timestamp, unsigned int conn_id
     m_keylist->clear();
     for (unsigned int i = 0; i < keys_count; i++) {
         get_key_response res = get_key_for_conn(GET_CMD_IDX, conn_id, &key_index);
-        /* Not supported in cluster mode */
-        assert(res == available_for_conn);
+        if (res != available_for_conn) continue;
 
         m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }
+
+    if (m_keylist->get_keys_count() == 0) return false;
 
     m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
     return true;
@@ -655,9 +656,16 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
         }
 
         // MGET command
-        if (!create_mget_request(timestamp, conn_id)) return;
+        if (!create_mget_request(timestamp, conn_id)) {
+            // No MGET could be sent (e.g. this cluster connection owns no
+            // slots that map to the configured key range). Force the ratio
+            // counter past the threshold so the next create_request() call
+            // resets both counters instead of busy-spinning here forever.
+            m_get_ratio_count = m_config->ratio.b;
+            return;
+        }
 
-        m_get_ratio_count += m_config->multi_key_get;
+        m_get_ratio_count += m_keylist->get_keys_count();
         m_reqs_generated++;
     } else {
         // overlap counters
