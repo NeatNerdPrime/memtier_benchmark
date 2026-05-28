@@ -70,6 +70,17 @@ def _flush_cluster(env):
         conn.execute_command("FLUSHALL")
 
 
+def _cluster_dbsize(env):
+    """Total number of keys across all master shards."""
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        try:
+            total += int(conn.execute_command("DBSIZE"))
+        except Exception:
+            continue
+    return total
+
+
 def _get_from_cluster(env, key):
     """GET a key from whichever master owns its slot. Returns the decoded
     string value or None if unset/unreachable."""
@@ -122,12 +133,18 @@ def test_transaction_pipelined_no_breakage(env):
         '--command=EXEC',
         '--command=UNWATCH',
     ]
+    _flush_cluster(env)
     ok, run_config, stderr = _run_transaction(env, cmds, pipeline=8, threads=2, clients=4, requests=600)
 
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok, message="memtier_benchmark exited non-zero at --pipeline=8")
         _assert_no_transaction_breakage(env, stderr)
+        # Side-effect check: the SET inside MULTI/EXEC must actually commit data,
+        # so a silently-dropped/interleaved transaction (no stderr error, wrong
+        # data) cannot pass this test.
+        env.assertTrue(_cluster_dbsize(env) > 0,
+                       message="no keys committed — pipelined transactions may have been dropped")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -204,12 +221,17 @@ def test_transaction_pipelined_minimal_multi_exec(env):
         '--command=INCR  {mx}-counter',
         '--command=EXEC',
     ]
+    _flush_cluster(env)
     ok, run_config, stderr = _run_transaction(env, cmds, pipeline=4, threads=2, clients=4, requests=400)
 
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok)
         _assert_no_transaction_breakage(env, stderr)
+        # {mx}-counter must have been INCR'd inside the committed transactions.
+        counter = _get_from_cluster(env, "{mx}-counter")
+        env.assertTrue(counter is not None and int(counter) > 0,
+                       message="{mx}-counter not committed — pipelined MULTI/EXEC may have been dropped")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
