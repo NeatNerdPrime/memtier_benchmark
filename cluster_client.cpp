@@ -487,7 +487,13 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * producers pause until responses bring the backlog back under budget. */
     if (m_config->monitor_input != NULL && m_staged_monitor_commands[conn_id].empty() &&
         m_key_index_pools[conn_id]->empty()) {
-        const unsigned long long in_flight = m_reqs_generated - m_reqs_processed;
+        // Clamp the subtraction: m_reqs_generated is normally >= m_reqs_processed,
+        // but with --retry-on-error a redirected/replayed request can be processed
+        // more than once without a matching generated bump. An unsigned underflow
+        // here would wrap to a huge value and wedge this producer permanently, so
+        // guard it defensively.
+        const unsigned long long in_flight =
+            m_reqs_generated > m_reqs_processed ? m_reqs_generated - m_reqs_processed : 0;
         const unsigned long long in_flight_budget =
             (unsigned long long) m_config->pipeline * (unsigned long long) m_connections.size();
         if (in_flight >= in_flight_budget) {
