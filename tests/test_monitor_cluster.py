@@ -209,7 +209,10 @@ def test_monitor_cluster_sequential_each_command_applied_once(env):
     lands it off its computed owner. SET would mask duplication. Combined with
     `total DBSIZE == N` this proves the staged-queue accounting nets out (no
     hang) and routing is correct."""
-    if not env.isCluster() or not _require_multi_shard(env):
+    if not env.isCluster():
+        env.skip()
+        return
+    if not _require_multi_shard(env):
         return
 
     _flush_cluster(env)
@@ -256,7 +259,10 @@ def test_monitor_cluster_random_distributes_and_attributes_stats(env):
     (cross-shard routing actually happened), and attribute per-command stats
     correctly even though commands are staged to and drained from other shards
     (Sets and Gets each non-zero and summing to Totals)."""
-    if not env.isCluster() or not _require_multi_shard(env):
+    if not env.isCluster():
+        env.skip()
+        return
+    if not _require_multi_shard(env):
         return
 
     _flush_cluster(env)
