@@ -1046,21 +1046,29 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             handle_moved(conn_id, timestamp, request, response);
             // With --transaction, retrying a mid-rotation command on the new
             // slot owner would split the MULTI/EXEC block across two shard
-            // connections. Drop the rotation instead, reset the pin so the
-            // next rotation can start fresh on the updated topology, and warn
-            // once about stat inaccuracy.
-            if (m_config->transaction && (int) conn_id == m_txn_pinned_conn_id) {
-                if (!m_txn_pin_lost_warned) {
-                    m_txn_pin_lost_warned = true;
-                    benchmark_error_log("warning: --transaction pin connection (id=%u) received MOVED "
-                                        "mid-rotation; topology changed; transaction stats for the "
-                                        "interrupted rotation will be inaccurate.\n",
-                                        conn_id);
-                }
-                txn_release_pin();
-                for (size_t i = 0; i < m_connections.size(); i++) {
-                    if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
-                        m_connections[i]->schedule_fill();
+            // connections. Drop the command instead. Reset the pin only when the
+            // MOVED is on the *current* pin connection: at --pipeline > 1 a later
+            // rotation may already hold the pin on another connection, and
+            // resetting it would disturb that in-flight rotation. Either way the
+            // dropped command is never retried elsewhere (no block split).
+            if (m_config->transaction) {
+                if ((int) conn_id == m_txn_pinned_conn_id) {
+                    if (!m_txn_pin_lost_warned) {
+                        m_txn_pin_lost_warned = true;
+                        benchmark_error_log("warning: --transaction pin connection (id=%u) received MOVED "
+                                            "mid-rotation; topology changed; transaction stats for the "
+                                            "interrupted rotation will be inaccurate.\n",
+                                            conn_id);
+                    }
+                    txn_release_pin();
+                    for (size_t i = 0; i < m_connections.size(); i++) {
+                        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                            m_connections[i]->schedule_fill();
+                    }
+                } else {
+                    benchmark_debug_log("--transaction: MOVED on stale (non-pin) connection %u dropped; "
+                                        "current pin=%d left intact\n",
+                                        conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
             } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
@@ -1077,18 +1085,24 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
             handle_ask(conn_id, timestamp, request, response);
-            if (m_config->transaction && (int) conn_id == m_txn_pinned_conn_id) {
-                if (!m_txn_pin_lost_warned) {
-                    m_txn_pin_lost_warned = true;
-                    benchmark_error_log("warning: --transaction pin connection (id=%u) received ASK "
-                                        "mid-rotation; topology changed; transaction stats for the "
-                                        "interrupted rotation will be inaccurate.\n",
-                                        conn_id);
-                }
-                txn_release_pin();
-                for (size_t i = 0; i < m_connections.size(); i++) {
-                    if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
-                        m_connections[i]->schedule_fill();
+            if (m_config->transaction) {
+                if ((int) conn_id == m_txn_pinned_conn_id) {
+                    if (!m_txn_pin_lost_warned) {
+                        m_txn_pin_lost_warned = true;
+                        benchmark_error_log("warning: --transaction pin connection (id=%u) received ASK "
+                                            "mid-rotation; topology changed; transaction stats for the "
+                                            "interrupted rotation will be inaccurate.\n",
+                                            conn_id);
+                    }
+                    txn_release_pin();
+                    for (size_t i = 0; i < m_connections.size(); i++) {
+                        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                            m_connections[i]->schedule_fill();
+                    }
+                } else {
+                    benchmark_debug_log("--transaction: ASK on stale (non-pin) connection %u dropped; "
+                                        "current pin=%d left intact\n",
+                                        conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
             } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
