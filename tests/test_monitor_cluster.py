@@ -102,6 +102,19 @@ def _set_line(key, value):
     return '[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "{}" "{}"'.format(key, value)
 
 
+def _incr_line(key):
+    return '[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCR" "{}"'.format(key)
+
+
+def _require_multi_shard(env):
+    """Skip on a single-master cluster (SHARDS=1): the cross-shard routing
+    assertions below are meaningful only with >= 2 masters."""
+    if len(_master_conns(env)) < 2:
+        env.skip()
+        return False
+    return True
+
+
 def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
                          threads=2, clients=4, requests=200, extra=None):
     """Run a monitor-input cluster workload; return (ok, run_config, json_dict)."""
@@ -127,7 +140,8 @@ def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
 
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
     ok = benchmark.run()
-    debugPrintMemtierOnError(run_config, env)
+    # Note: callers print mb output via debugPrintMemtierOnError in their own
+    # finally-on-failure blocks, so we don't print here (avoids double output).
 
     js = {}
     json_path = "{}/mb.json".format(run_config.results_dir)
@@ -138,12 +152,17 @@ def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
 
 
 # ---------------------------------------------------------------------------
-# 1. Specific monitor line (__monitor_line1__) routes to the slot owner
+# 1. A single staged command (__monitor_line@__) routes to the slot owner
 # ---------------------------------------------------------------------------
 
-def test_monitor_cluster_specific_command_routes_to_owner(env):
-    """A specific SET monitor command must commit to the slot-owning shard (and
-    only that shard) — the keyless-to-keyed routing of the staged command."""
+def test_monitor_cluster_single_command_staged_to_owner(env):
+    """A monitor SET replayed via __monitor_line@__ (the route-then-stage path,
+    create_monitor_request_cluster) must be staged to and commit on its slot
+    owner — and ONLY there (exactly one copy cluster-wide, no MOVED leakage).
+
+    Note: __monitor_line@__ (not __monitor_lineN__) is required to exercise
+    staging — specific-line placeholders are expanded at config time into an
+    ordinary keyed command that takes the normal routing path."""
     if not env.isCluster():
         env.skip()
         return
@@ -152,8 +171,11 @@ def test_monitor_cluster_specific_command_routes_to_owner(env):
     test_dir = tempfile.mkdtemp()
     monitor_file = _write_monitor_file(test_dir, [_set_line("mon-key1", "value1")])
 
+    # Single line => __monitor_line@__ selection always picks it; it is staged
+    # to mon-key1's slot owner and drained there.
     ok, run_config, _js = _run_monitor_cluster(
-        env, monitor_file, "__monitor_line1__", threads=1, clients=1, requests=50)
+        env, monitor_file, "__monitor_line@__", monitor_pattern="S",
+        threads=1, clients=1, requests=50)
 
     failed = env.getNumberOfFailedAssertion()
     try:
@@ -177,19 +199,23 @@ def test_monitor_cluster_specific_command_routes_to_owner(env):
 # 2. Sequential replay: every SET is routed and committed exactly once
 # ---------------------------------------------------------------------------
 
-def test_monitor_cluster_sequential_all_keys_committed(env):
-    """__monitor_line@__ sequential over N distinct SET keys spanning shards:
-    every SET must be routed to the correct owner and committed (total DBSIZE
-    == N, spread across >= 2 shards). Proves no command is lost to a wrong-shard
-    send and the staged-queue accounting nets out (the run terminates)."""
-    if not env.isCluster():
-        env.skip()
+def test_monitor_cluster_sequential_each_command_applied_once(env):
+    """__monitor_line@__ sequential over N distinct INCR keys spanning shards:
+    every INCR must be routed to the correct owner and applied EXACTLY once.
+
+    INCR (not SET) is used deliberately: it is not idempotent, so the per-key
+    value pins down the regression class precisely — a dropped command leaves
+    the key absent, a duplicated command leaves it at 2, and a wrong-shard send
+    lands it off its computed owner. SET would mask duplication. Combined with
+    `total DBSIZE == N` this proves the staged-queue accounting nets out (no
+    hang) and routing is correct."""
+    if not env.isCluster() or not _require_multi_shard(env):
         return
 
     _flush_cluster(env)
     test_dir = tempfile.mkdtemp()
     n = 60
-    lines = [_set_line("mc:{}".format(i), "v{}".format(i)) for i in range(n)]
+    lines = [_incr_line("mc:{}".format(i)) for i in range(n)]
     monitor_file = _write_monitor_file(test_dir, lines)
 
     # Sequential pattern + requests == number of lines => each line runs once.
@@ -202,16 +228,18 @@ def test_monitor_cluster_sequential_all_keys_committed(env):
         env.assertTrue(ok, message="sequential monitor-cluster run did not complete")
         total, shards = _dbsize_total_and_shards(env)
         env.assertEqual(total, n,
-                        message="expected {} committed keys, got {} (routing lost commands?)".format(n, total))
+                        message="expected {} committed keys, got {} (commands lost/duplicated?)".format(n, total))
         env.assertTrue(shards >= 2,
                        message="keys landed on only {} shard(s) — cross-shard staging not exercised".format(shards))
-        # Spot-check a few keys live on their computed owner.
+        # Each INCR must have been applied exactly once -> value "1" on its owner.
         for i in (0, n // 2, n - 1):
             key = "mc:{}".format(i)
-            owner = _owning_port(env, key)
-            owner_conn = _conn_for_port(env, owner)
-            env.assertTrue(owner_conn is not None and owner_conn.execute_command("EXISTS", key),
-                           message="{} not on its owning shard {}".format(key, owner))
+            owner_conn = _conn_for_port(env, _owning_port(env, key))
+            val = owner_conn.execute_command("GET", key) if owner_conn is not None else None
+            if isinstance(val, bytes):
+                val = val.decode()
+            env.assertEqual(val, "1",
+                            message="{} = {!r} on its owner (expected '1'; drop/dup/misroute?)".format(key, val))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -225,8 +253,7 @@ def test_monitor_cluster_random_completes_and_distributes(env):
     """__monitor_line@__ random over keys spanning shards: the run must complete
     (no hang / no accounting deadlock) under --requests, with data landing on
     multiple shards."""
-    if not env.isCluster():
-        env.skip()
+    if not env.isCluster() or not _require_multi_shard(env):
         return
 
     _flush_cluster(env)
@@ -260,8 +287,7 @@ def test_monitor_cluster_stats_attribution_by_type(env):
     stats correctly even though commands are staged to and drained from other
     shards: the JSON must expose multiple per-type sections with non-zero counts
     that sum to the Totals count."""
-    if not env.isCluster():
-        env.skip()
+    if not env.isCluster() or not _require_multi_shard(env):
         return
 
     _flush_cluster(env)
@@ -292,6 +318,13 @@ def test_monitor_cluster_stats_attribution_by_type(env):
         env.assertEqual(sets_count + gets_count, totals_count,
                         message="per-type counts ({}+{}) != Totals ({})".format(
                             sets_count, gets_count, totals_count))
+        # Server-side placement: the SETs must actually have landed on >= 2
+        # shards. This is what proves routing happened (the count equality above
+        # is only an accounting-conservation check and holds even if every op
+        # ran inline on the seed node).
+        _total, shards = _dbsize_total_and_shards(env)
+        env.assertTrue(shards >= 2,
+                       message="SET data reached only {} shard(s) — cross-shard routing not exercised".format(shards))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
