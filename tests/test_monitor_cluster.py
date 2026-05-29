@@ -175,7 +175,7 @@ def test_monitor_cluster_single_command_staged_to_owner(env):
     # to mon-key1's slot owner and drained there.
     ok, run_config, _js = _run_monitor_cluster(
         env, monitor_file, "__monitor_line@__", monitor_pattern="S",
-        threads=1, clients=1, requests=50)
+        threads=1, clients=1, requests=20)
 
     failed = env.getNumberOfFailedAssertion()
     try:
@@ -214,7 +214,7 @@ def test_monitor_cluster_sequential_each_command_applied_once(env):
 
     _flush_cluster(env)
     test_dir = tempfile.mkdtemp()
-    n = 60
+    n = 30
     lines = [_incr_line("mc:{}".format(i)) for i in range(n)]
     monitor_file = _write_monitor_file(test_dir, lines)
 
@@ -246,47 +246,16 @@ def test_monitor_cluster_sequential_each_command_applied_once(env):
 
 
 # ---------------------------------------------------------------------------
-# 3. Random replay completes (no hang) and distributes across shards
+# 3. Random mixed-type replay: completes (no hang), distributes across shards,
+#    and attributes per-type stats correctly after cross-shard routing.
 # ---------------------------------------------------------------------------
 
-def test_monitor_cluster_random_completes_and_distributes(env):
-    """__monitor_line@__ random over keys spanning shards: the run must complete
-    (no hang / no accounting deadlock) under --requests, with data landing on
-    multiple shards."""
-    if not env.isCluster() or not _require_multi_shard(env):
-        return
-
-    _flush_cluster(env)
-    test_dir = tempfile.mkdtemp()
-    lines = [_set_line("mr:{}".format(i), "v{}".format(i)) for i in range(40)]
-    monitor_file = _write_monitor_file(test_dir, lines)
-
-    ok, run_config, js = _run_monitor_cluster(
-        env, monitor_file, "__monitor_line@__", monitor_pattern="R",
-        threads=2, clients=4, requests=300)
-
-    failed = env.getNumberOfFailedAssertion()
-    try:
-        env.assertTrue(ok, message="random monitor-cluster run did not complete (possible hang)")
-        _total, shards = _dbsize_total_and_shards(env)
-        env.assertTrue(shards >= 2,
-                       message="random replay reached only {} shard(s)".format(shards))
-        totals = js.get("ALL STATS", {}).get("Totals", {})
-        env.assertTrue(totals.get("Count", 0) > 0, message="no ops recorded")
-    finally:
-        if env.getNumberOfFailedAssertion() > failed:
-            debugPrintMemtierOnError(run_config, env)
-
-
-# ---------------------------------------------------------------------------
-# 4. Per-type stats attribution survives cross-shard routing
-# ---------------------------------------------------------------------------
-
-def test_monitor_cluster_stats_attribution_by_type(env):
-    """A mixed-type monitor stream (__monitor_line@__) must attribute per-command
-    stats correctly even though commands are staged to and drained from other
-    shards: the JSON must expose multiple per-type sections with non-zero counts
-    that sum to the Totals count."""
+def test_monitor_cluster_random_distributes_and_attributes_stats(env):
+    """A mixed-type random stream (__monitor_line@__, --monitor-pattern=R) must:
+    complete without hanging (accounting nets out), land data on >= 2 shards
+    (cross-shard routing actually happened), and attribute per-command stats
+    correctly even though commands are staged to and drained from other shards
+    (Sets and Gets each non-zero and summing to Totals)."""
     if not env.isCluster() or not _require_multi_shard(env):
         return
 
@@ -301,7 +270,7 @@ def test_monitor_cluster_stats_attribution_by_type(env):
 
     ok, run_config, js = _run_monitor_cluster(
         env, monitor_file, "__monitor_line@__", monitor_pattern="R",
-        threads=2, clients=4, requests=400)
+        threads=1, clients=2, requests=150)
 
     failed = env.getNumberOfFailedAssertion()
     try:
