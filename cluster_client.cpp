@@ -1065,6 +1065,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                         if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
                             m_connections[i]->schedule_fill();
                     }
+                } else {
+                    benchmark_debug_log("--transaction: MOVED on stale (non-pin) connection %u dropped; "
+                                        "current pin=%d left intact\n",
+                                        conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
             } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
@@ -1095,6 +1099,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                         if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
                             m_connections[i]->schedule_fill();
                     }
+                } else {
+                    benchmark_debug_log("--transaction: ASK on stale (non-pin) connection %u dropped; "
+                                        "current pin=%d left intact\n",
+                                        conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
             } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {

@@ -19,6 +19,15 @@ These tests run only against OSS-CLUSTER and assert:
    regardless of pipeline depth (proves no lost/dropped/interleaved
    transactions).
 
+Coverage note: these tests run against a STATIC cluster topology, so no MOVED/
+ASK is emitted mid-run. The transaction-mode redirect handling (drop the
+command without retrying it elsewhere, reset the pin only on the current pin)
+is therefore not exercised here — triggering a slot migration at the exact
+moment a rotation is mid-flight on the pin is inherently racy/flaky in this
+harness. That path is validated by code review and by reasoning about the
+accounting (every sent command is processed exactly once, so the run cannot
+hang or mis-count); see cluster_client.cpp handle_response MOVED/ASK branches.
+
 Run:
     TEST=test_transaction_pipeline.py OSS_CLUSTER=1 SHARDS=3 ./tests/run_tests.sh
 """
@@ -210,7 +219,9 @@ def test_transaction_pipeline_commit_count_matches_baseline(env):
 
 def test_transaction_pipelined_minimal_multi_exec(env):
     """Minimal MULTI/SET/INCR/EXEC (leading keyless MULTI, two keyed commands
-    sharing a hash tag) at pipeline=4 — must complete with no breakage."""
+    sharing a hash tag) at pipeline=4. The shared {mx}-counter is INCR'd once
+    per committed rotation, so its final value must equal the exact number of
+    full rotations — proving no transaction was dropped, duplicated, or split."""
     if not env.isCluster():
         env.skip()
         return
@@ -221,17 +232,27 @@ def test_transaction_pipelined_minimal_multi_exec(env):
         '--command=INCR  {mx}-counter',
         '--command=EXEC',
     ]
+    # 4-command rotation; total commands = threads*clients*requests, all divisible
+    # by 4, so the counter == number of full rotations exactly.
+    threads, clients, requests = 2, 4, 400
+    expected = (threads * clients * requests) // 4  # 800 committed INCRs
+
     _flush_cluster(env)
-    ok, run_config, stderr = _run_transaction(env, cmds, pipeline=4, threads=2, clients=4, requests=400)
+    ok, run_config, stderr = _run_transaction(env, cmds, pipeline=4, threads=threads,
+                                              clients=clients, requests=requests)
 
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok)
         _assert_no_transaction_breakage(env, stderr)
-        # {mx}-counter must have been INCR'd inside the committed transactions.
+        # Exact commit count: a dropped/duplicated/split transaction would move
+        # this off `expected`.
         counter = _get_from_cluster(env, "{mx}-counter")
-        env.assertTrue(counter is not None and int(counter) > 0,
+        env.assertTrue(counter is not None,
                        message="{mx}-counter not committed — pipelined MULTI/EXEC may have been dropped")
+        env.assertEqual(int(counter), expected,
+                        message="{{mx}}-counter={} != expected {} committed rotations".format(
+                            counter, expected))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
