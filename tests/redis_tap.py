@@ -191,7 +191,14 @@ if __name__ == "__main__":
                  server_log="/tmp/tap_s2c.bin").start()
     print(f"tap listening on {t.listen_port} -> {upstream}", flush=True)
     try:
+        # Block on stdin so the tap stays up; on EOF (`</dev/null`) or any
+        # broken-pipe read we exit cleanly instead of spinning on a busy
+        # zero-byte loop (cursor bugbot finding).
         while True:
-            os.read(0, 4096)
+            data = os.read(0, 4096)
+            if not data:
+                break
     except (KeyboardInterrupt, OSError):
+        pass
+    finally:
         t.stop()

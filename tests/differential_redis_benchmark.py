@@ -173,7 +173,16 @@ def _info_field(port, section, field):
     return None
 
 
-def _commandstats_total_calls(port):
+def _commandstats_total_calls(port, only=None):
+    """Sum `calls` across all `cmdstat_*` entries (or only the named ones).
+
+    ``only`` is an iterable of lowercase command names (e.g. ``{"get"}``).
+    When set, only those commands' calls are summed -- needed for check #4,
+    where the assertion compares memtier's GET-only count against the
+    server's cmdstat_get.calls; summing ALL cmdstat_* would also include
+    the INFO/CONFIG commands the differential harness itself issues
+    between RESETSTAT and the comparison (cursor bugbot finding).
+    """
     out = subprocess.run([_require(REDIS_CLI), "-p", str(port),
                           "INFO", "commandstats"],
                          capture_output=True, text=True, timeout=5.0)
@@ -181,8 +190,10 @@ def _commandstats_total_calls(port):
     for line in out.stdout.splitlines():
         if not line.startswith("cmdstat_"):
             continue
+        head, _, payload = line.partition(":")
+        if only is not None and head[len("cmdstat_"):].lower() not in only:
+            continue
         try:
-            payload = line.split(":", 1)[1]
             for field in payload.split(","):
                 k, _, v = field.partition("=")
                 if k == "calls":
@@ -302,7 +313,8 @@ def test_diff_hits_vs_keyspace_hits(redis_server):
 
         srv_hits = int(_info_field(port, "stats", "keyspace_hits"))
         srv_misses = int(_info_field(port, "stats", "keyspace_misses"))
-        srv_get_calls = _commandstats_total_calls(port)
+        # Filter to cmdstat_get only — see _commandstats_total_calls docstring.
+        srv_get_calls = _commandstats_total_calls(port, only={"get"})
 
         assert mt_misses_per_sec == 0.0, (
             f"Expected zero misses, got {mt_misses_per_sec}/sec")
