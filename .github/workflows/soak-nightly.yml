@@ -1,0 +1,129 @@
+name: Soak / Stress (nightly)
+
+# Long-running soak / stress / chaos suite for memtier_benchmark.
+# Lives outside PR CI -- runs on a nightly cron and on manual dispatch
+# (NOT on pull_request / push, so PR CI minutes stay unaffected).
+#
+# Total budget: 60 minutes. Scenarios run as a fail-fast: false matrix so
+# one regression doesn't mask the others.
+#
+# Scenarios (see tests/soak/):
+#   S1  long_run_memory       -- 30 min soak, RSS slope check
+#   S2  large_payloads        -- regression guard for #404/#405 (giant MONITOR lines)
+#   S3  high_concurrency      -- 32t/256c, FD hygiene check
+#   S4  connection_churn      -- reconnect churn vs CLIENT KILL TYPE normal
+#   S5  cluster_turbulence    -- 3-master cluster + FAILOVER + reshard mid-run
+#   S6  retry_storm           -- python -ERR shim + --retry-on-error
+#   S7  slow_network          -- tc netem 200ms +/- 20ms, 1% loss
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            build-essential autoconf automake pkg-config \
+            libevent-dev libssl-dev zlib1g-dev
+
+      - name: Build release memtier_benchmark
+        run: autoreconf -ivf && ./configure && make -j
+
+      - name: Smoke-test binary
+        run: ./memtier_benchmark --version
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: memtier-soak-binary
+          path: |
+            memtier_benchmark
+          retention-days: 2
+
+  soak:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          # `test` is the path passed to RLTest --test, relative to tests/
+          # (run_tests.sh cds into tests/ before invoking RLTest).
+          - { id: S1, test: soak/test_long_run_memory.py,    minutes: 35, cluster: 0 }
+          - { id: S2, test: soak/test_large_payloads.py,     minutes: 10, cluster: 0 }
+          - { id: S3, test: soak/test_high_concurrency.py,   minutes: 10, cluster: 0 }
+          - { id: S4, test: soak/test_connection_churn.py,   minutes: 10, cluster: 0 }
+          - { id: S5, test: soak/test_cluster_turbulence.py, minutes: 15, cluster: 1 }
+          - { id: S6, test: soak/test_retry_storm.py,        minutes: 10, cluster: 0 }
+          - { id: S7, test: soak/test_slow_network.py,       minutes: 10, cluster: 0 }
+    name: ${{ matrix.scenario.id }} ${{ matrix.scenario.test }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download memtier binary
+        uses: actions/download-artifact@v8
+        with:
+          name: memtier-soak-binary
+
+      - name: Restore executable permissions
+        run: chmod +x memtier_benchmark
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            libevent-dev libssl-dev iproute2
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+          architecture: x64
+
+      - name: Install Python dependencies
+        run: pip install -r ./tests/test_requirements.txt
+
+      - name: Install Redis
+        run: |
+          curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get -qq update
+          sudo apt-get install -y redis
+          sudo service redis-server stop || true
+
+      - name: Tune kernel for soak workloads
+        run: |
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=10
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+          ulimit -n 65536
+
+      - name: Run scenario ${{ matrix.scenario.id }}
+        timeout-minutes: ${{ matrix.scenario.minutes }}
+        env:
+          OSS_STANDALONE: ${{ matrix.scenario.cluster == 0 && '1' || '0' }}
+          OSS_CLUSTER: ${{ matrix.scenario.cluster == 1 && '1' || '0' }}
+          VERBOSE: "1"
+          TEST: ${{ matrix.scenario.test }}
+        run: |
+          ./tests/run_tests.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: soak-${{ matrix.scenario.id }}-logs
+          path: |
+            tests/logs/
+            /tmp/RLTest_*
+          retention-days: 7
+          if-no-files-found: ignore
