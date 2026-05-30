@@ -57,6 +57,18 @@ from mb import Benchmark, RunConfig
 _BIG_BLOB_MB = int(os.environ.get("MEMTIER_STRESS_BIG_BLOB_MB", "8"))
 _RECONNECT_TEST_TIME = int(os.environ.get("MEMTIER_STRESS_RECONNECT_TIME", "30"))
 
+# RLTest autodiscovers every ``tests/test_*.py``; without an in-test gate the
+# stress scenarios run on every normal sanitizer cell too and blow the
+# (raised, but still bounded) 45-minute job timeout. The dedicated STRESS
+# matrix axis in ``.github/workflows/{asan,ubsan,tsan}.yml`` sets STRESS=1;
+# elsewhere we no-op via ``env.skip()`` so the file is harmless to discover.
+_STRESS_MODE = os.environ.get("STRESS", "0") == "1"
+
+
+def _require_stress_mode(env):
+    if not _STRESS_MODE:
+        env.skip()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -124,6 +136,7 @@ def test_huge_data_size_under_load(env):
     allocation accounting, and cluster fan-out buffering -- the same
     surface area implicated in the issue #411 gap matrix.
     """
+    _require_stress_mode(env)
     # Cluster + standalone both supported (no monitor input here).
     args = [
         "--ratio=1:1",
@@ -156,6 +169,7 @@ def test_huge_monitor_line_cluster(env):
     resolve to one slot and the cluster routing layer does not have to
     fan out a giant blob across multiple shards.
     """
+    _require_stress_mode(env)
     if not env.isCluster():
         # The standalone variant is already covered by
         # tests/soak/test_large_payloads.py; here we only assert the
@@ -234,6 +248,7 @@ def test_huge_key_prefix_cluster_pipeline(env):
     connection-flush, so this test maximises the dynamic-buffer
     allocation churn introduced by PR #379.
     """
+    _require_stress_mode(env)
     # Works on both standalone and cluster. Keys are not hash-tagged on
     # purpose: we want the cluster routing layer to distribute the giant
     # prefix across shards.
@@ -266,6 +281,7 @@ def test_reconnect_churn_long_run(env):
     so the close()/connect() codepaths see repeated traversals under
     ASAN/UBSan/TSAN.
     """
+    _require_stress_mode(env)
     # --reconnect-interval is intentionally unsupported in cluster mode
     # (memtier exits with: "cluster mode dose not support reconnect-interval option").
     env.skipOnCluster()
@@ -299,6 +315,7 @@ def test_debug_flag_paths(env):
     which are precisely the family of latent bugs the issue #411 gap
     matrix calls out.
     """
+    _require_stress_mode(env)
     args = [
         "--debug",
         "--ratio=1:1",
