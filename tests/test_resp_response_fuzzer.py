@@ -196,6 +196,15 @@ def _assert_no_crash(env, fixture_name):
         env, fixture_name
     )
 
+    # _run_fixture returns a "mock server failed to bind" stderr_text when
+    # _wait_for_port times out. Without an explicit skip here the assertions
+    # below would all silently pass (no crash, no needle, no hang were ever
+    # populated) and the test would report a green run with zero coverage
+    # (cursor bugbot finding). Skip on test-infra failure.
+    if stderr_text == "mock server failed to bind":
+        env.skip()
+        return
+
     # Emit context so failures are debuggable without rerunning.
     if crashed or needle_hit or hung:
         sys.stderr.write(
