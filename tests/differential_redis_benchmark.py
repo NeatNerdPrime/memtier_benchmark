@@ -9,6 +9,13 @@ because they:
   * require ``redis-benchmark`` and ``redis-cli`` on PATH,
   * assert tolerance-bounded equalities on noisy observables.
 
+This file deliberately does NOT start with ``test_`` so RLTest's
+autodiscovery in ``tests/run_tests.sh`` skips it -- pytest is the
+intended runner. Invoke explicitly:
+
+    RUN_DIFFERENTIAL=1 MEMTIER_BINARY=$(pwd)/memtier_benchmark \\
+        pytest tests/differential_redis_benchmark.py -v
+
 When any of those preconditions is missing, every check ``skip``s — they
 never hard-fail by missing tools. This keeps the default CI green even on
 runners where the redis-tools package is not installed.
@@ -71,9 +78,6 @@ import socket
 import subprocess
 import tempfile
 import time
-
-import pytest
-
 
 # ---------------------------------------------------------------------------
 # Skip guards
