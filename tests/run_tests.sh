@@ -19,6 +19,9 @@ help() {
 		OSS_CLUSTER=0|1     General tests on Redis OSS Cluster
 		TLS=0|1             Run tests with TLS enabled
 		SHARDS=n            Number of shards (default: 3)
+		STRESS=0|1          Override default test set with tests/test_sanitizer_stress.py
+		                    (large data, long monitor lines, reconnect churn, --debug paths).
+		                    Used by the sanitizer workflows' STRESS matrix axis (issue #411).
 
 		REDIS_SERVER=path   Location of redis-server
 		VERBOSE=1           Print commands
@@ -71,6 +74,15 @@ OSS_STANDALONE=${OSS_STANDALONE:-1}
 OSS_CLUSTER=${OSS_CLUSTER:-0}
 SHARDS=${SHARDS:-3}
 TEST=${TEST:-""}
+STRESS=${STRESS:-0}
+
+# STRESS=1 overrides the default test set with the sanitizer stress suite
+# (tests/test_sanitizer_stress.py), which exercises large data sizes, long
+# monitor-input lines, huge key prefixes, reconnect churn and --debug
+# codepaths under sanitizers. See GH issue #411.
+if [[ $STRESS == 1 && -z $TEST ]]; then
+	TEST="test_sanitizer_stress.py"
+fi
 
 TLS_KEY=$ROOT/tests/tls/redis.key
 TLS_CERT=$ROOT/tests/tls/redis.crt
