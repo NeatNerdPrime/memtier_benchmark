@@ -195,9 +195,11 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
                 sys.stderr.write(e.stderr.decode("utf-8", "replace")[-2048:] + "\n")
             return False
         blob = (proc.stdout or b"") + (proc.stderr or b"")
-        if any(p in blob for p in KNOWN_NONFATAL_ASSERTIONS):
-            os.unlink(mpath)
-            return True
+        # IMPORTANT: check crash signals / sanitizer patterns BEFORE the
+        # known-nonfatal allowlist. A run can produce a parser assertion
+        # message AND still crash via SIGSEGV or trip an ASAN report; if we
+        # filtered on the assertion text first we would swallow the crash
+        # silently and delete the repro (cursor bugbot finding).
         if proc.returncode in CRASH_SIGNALS or proc.returncode == 42:
             sys.stderr.write(
                 "FAIL [{}] crash exit={} -- repro saved at {}\n".format(
@@ -215,6 +217,11 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
                 )
                 sys.stderr.write(blob.decode("utf-8", "replace")[-2048:] + "\n")
                 return False
+        # Crash checks passed -- now safe to allowlist known-nonfatal parser
+        # assertions on an otherwise-clean exit.
+        if any(p in blob for p in KNOWN_NONFATAL_ASSERTIONS):
+            os.unlink(mpath)
+            return True
         # Clean run (parse error, no commands, connection refused all OK).
         os.unlink(mpath)
         return True
