@@ -1,3 +1,6 @@
 * text=auto
 * text eol=lf
 *.png binary
+# Adversarial RESP fuzzer fixtures are exact byte sequences -- do not
+# touch line endings.
+tests/fixtures/resp_payloads/*.bin binary
