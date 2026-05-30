@@ -250,10 +250,15 @@ def _assert_no_crash(env, fixture_name):
 def _skip_if_unsupported(env):
     """Common skip for environments that cannot run this harness."""
     # The harness runs memtier against its own mock server on 127.0.0.1
-    # and does not need RLTest's redis at all - but it does need the
-    # mock server script and a real memtier binary. Cluster-mode RLTest
-    # cells still work (memtier just talks to the mock), so we do not
-    # skipOnCluster here. Unix-socket env is also fine since we use TCP.
+    # and does not need RLTest's redis at all. We DO skip on cluster mode
+    # though: RLTest would still bootstrap and tear down a fresh 3-shard
+    # TLS cluster per test (one per RESP fixture x 12 fixtures ~ 6+ min of
+    # pure setup), which pushed `Test OSS-CLUSTER API: TCP TLS` over its
+    # 15-minute job budget. The mock-server contract is mode-independent,
+    # so cluster coverage adds nothing here.
+    if env.isCluster():
+        env.skip()
+        return True
     if not os.path.isfile(MOCK_SERVER):
         env.skip()
         return True
