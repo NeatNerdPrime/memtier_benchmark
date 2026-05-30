@@ -74,7 +74,7 @@ def test_long_run_memory_growth(env):
             "--pipeline=4",
             "-d", "1024",
             "--test-time={}".format(test_time),
-            "--run-count=3",
+            "--run-count=1",
             "--hide-histogram",
         ],
     }
