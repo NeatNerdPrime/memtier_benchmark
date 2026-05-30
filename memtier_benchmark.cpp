@@ -105,21 +105,33 @@ static std::vector<cg_thread *> *g_threads = NULL;
 // and a SIGSEGV caused by stack-overflow is unrecoverable (the handler
 // re-faults on the exhausted stack and produces no report at all).
 // 64 KiB is comfortably above SIGSTKSZ on every supported platform.
+//
+// The buffer lives in TLS (a static __thread array) rather than malloc so
+// LeakSanitizer doesn't flag it at clean exit and so the install path is
+// allocation-free — workers can call this from cg_thread_start without
+// allocating from the main heap. We also skip installation when something
+// upstream (e.g. ASan/LSan/UBSan's own runtime) has already registered an
+// alt stack for us; replacing theirs would break their crash reporting.
 #define MEMTIER_ALT_STACK_SIZE (64 * 1024)
+static __thread char tls_altstack_buf[MEMTIER_ALT_STACK_SIZE];
 static __thread bool tls_altstack_installed = false;
 
 static void install_alt_signal_stack(void)
 {
     if (tls_altstack_installed) return;
+    stack_t existing;
+    if (sigaltstack(NULL, &existing) == 0 && (existing.ss_flags & SS_DISABLE) == 0 && existing.ss_sp != NULL &&
+        existing.ss_size >= (size_t) MINSIGSTKSZ) {
+        // A previous installer (sanitizer runtime, etc.) owns this; leave it.
+        tls_altstack_installed = true;
+        return;
+    }
     stack_t ss;
-    ss.ss_sp = malloc(MEMTIER_ALT_STACK_SIZE);
-    if (ss.ss_sp == NULL) return; // best-effort; SA_ONSTACK then falls back to the normal stack
+    ss.ss_sp = tls_altstack_buf;
     ss.ss_flags = 0;
-    ss.ss_size = MEMTIER_ALT_STACK_SIZE;
+    ss.ss_size = sizeof(tls_altstack_buf);
     if (sigaltstack(&ss, NULL) == 0) {
         tls_altstack_installed = true;
-    } else {
-        free(ss.ss_sp);
     }
 }
 
