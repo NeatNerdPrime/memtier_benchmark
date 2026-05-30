@@ -102,10 +102,13 @@ jobs:
           sudo service redis-server stop || true
 
       - name: Tune kernel for soak workloads
+        # `ulimit` set here is scoped to this step's shell only; GitHub
+        # Actions spawns a fresh shell per `run:` block, so it doesn't
+        # persist to the test step. Sysctls do persist (they're kernel
+        # state); ulimit is re-set inside the run-scenario step below.
         run: |
           sudo sysctl -w net.ipv4.tcp_fin_timeout=10
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1
-          ulimit -n 65536
 
       - name: Run scenario ${{ matrix.scenario.id }}
         timeout-minutes: ${{ matrix.scenario.minutes }}
@@ -115,6 +118,7 @@ jobs:
           VERBOSE: "1"
           TEST: ${{ matrix.scenario.test }}
         run: |
+          ulimit -n 65536
           ./tests/run_tests.sh
 
       - name: Upload logs on failure
