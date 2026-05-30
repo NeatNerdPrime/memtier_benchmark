@@ -41,6 +41,7 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <signal.h>
+#include <fcntl.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -100,6 +101,28 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
 // Global pointer to threads for crash handler access
 static std::vector<cg_thread *> *g_threads = NULL;
 
+// Per-thread alternate signal stack. Without this, SA_ONSTACK is a no-op
+// and a SIGSEGV caused by stack-overflow is unrecoverable (the handler
+// re-faults on the exhausted stack and produces no report at all).
+// 64 KiB is comfortably above SIGSTKSZ on every supported platform.
+#define MEMTIER_ALT_STACK_SIZE (64 * 1024)
+static __thread bool tls_altstack_installed = false;
+
+static void install_alt_signal_stack(void)
+{
+    if (tls_altstack_installed) return;
+    stack_t ss;
+    ss.ss_sp = malloc(MEMTIER_ALT_STACK_SIZE);
+    if (ss.ss_sp == NULL) return; // best-effort; SA_ONSTACK then falls back to the normal stack
+    ss.ss_flags = 0;
+    ss.ss_size = MEMTIER_ALT_STACK_SIZE;
+    if (sigaltstack(&ss, NULL) == 0) {
+        tls_altstack_installed = true;
+    } else {
+        free(ss.ss_sp);
+    }
+}
+
 // Signal handler for Ctrl+C
 static void sigint_handler(int signum)
 {
@@ -114,6 +137,13 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     struct tm *tm;
     time_t now;
     char timestr[64];
+
+    // Watchdog: if the handler itself hangs (e.g. mid-print_client_list while
+    // iterating a torn vector under heap corruption), the process is killed
+    // after 5 s instead of leaving a half-written report indefinitely. The
+    // original signal will be re-raised on a fresh sigaction below, but if
+    // we never get there, SIGALRM provides the floor.
+    alarm(5);
 
     // Get current time
     now = time(NULL);
@@ -207,9 +237,45 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     raise(sig);
 }
 
+// Pre-warm the symbols the crash handler will need so the dynamic linker
+// has already done a lazy-bind (_dl_fixup) on them by the time a signal
+// fires. _dl_fixup is NOT async-signal-safe; calling an unresolved symbol
+// for the first time from inside the handler triggers it and frequently
+// re-crashes mid-report (this is what truncated the bug report attached
+// to issue #404). Cost: a few µs at startup.
+static void prewarm_crash_handler(void)
+{
+#ifdef HAVE_EXECINFO_H
+    void *trace[4];
+    int n = backtrace(trace, 4);
+    // /dev/null discards; we only care about resolving the symbol.
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        if (n > 0) backtrace_symbols_fd(trace, n, devnull);
+        close(devnull);
+    }
+#endif
+    // Force glibc stdio's first-use init + symbol bind for fprintf/vfprintf.
+    fprintf(stderr, "%s", "");
+    fflush(stderr);
+    // Resolve event_get_version too — used in the INFO section.
+    (void) event_get_version();
+}
+
 // Setup crash handlers
 static void setup_crash_handlers(void)
 {
+    // Install the per-thread alternate signal stack BEFORE registering the
+    // handler. Without sigaltstack(2) the SA_ONSTACK flag is silently inert
+    // and a stack-overflow SIGSEGV re-faults on the exhausted stack —
+    // producing no report at all. (Workers install their own alt stack on
+    // entry in cg_thread_start.)
+    install_alt_signal_stack();
+
+    // Pre-warm before we register the handler so the symbols we'll need
+    // are already bound when the signal lands.
+    prewarm_crash_handler();
+
     struct sigaction act;
 
     sigemptyset(&act.sa_mask);
@@ -221,6 +287,15 @@ static void setup_crash_handlers(void)
     sigaction(SIGFPE, &act, NULL);
     sigaction(SIGILL, &act, NULL);
     sigaction(SIGABRT, &act, NULL);
+    // SIGALRM is the handler's own watchdog; if alarm(5) fires we want the
+    // default action (terminate the process) rather than re-entering the
+    // handler. Explicitly request SIG_DFL so the user can't have overridden
+    // it inadvertently.
+    struct sigaction alarm_act;
+    sigemptyset(&alarm_act.sa_mask);
+    alarm_act.sa_flags = 0;
+    alarm_act.sa_handler = SIG_DFL;
+    sigaction(SIGALRM, &alarm_act, NULL);
 }
 
 void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...)
@@ -1912,6 +1987,11 @@ static void *cg_thread_start(void *t)
 {
     cg_thread *thread = (cg_thread *) t;
 
+    // Each worker installs its own sigaltstack so a SIGSEGV caused by stack
+    // overflow on this thread (or any other handler entry) runs on a fresh
+    // stack rather than re-faulting on the exhausted one.
+    install_alt_signal_stack();
+
     try {
         thread->m_cg->run();
 
@@ -2037,11 +2117,13 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
 #ifdef HAVE_EXECINFO_H
     void *trace[100];
     int trace_size = backtrace(trace, 100);
-    char **messages = backtrace_symbols(trace, trace_size);
-    for (int i = 1; i < trace_size; i++) {
-        fprintf(fp, "[%d] %s #   %s\n", pid, timestr, messages[i]);
+    // backtrace_symbols_fd is the documented async-signal-safe variant;
+    // backtrace_symbols (which mallocs) is NOT and can re-fault when the
+    // crashing thread holds the malloc arena lock or the heap is corrupt.
+    fflush(fp);
+    if (trace_size > 1) {
+        backtrace_symbols_fd(trace + 1, trace_size - 1, fileno(fp));
     }
-    free(messages);
 #else
     fprintf(fp, "[%d] %s #   (backtrace not available on this platform)\n", pid, timestr);
 #endif
