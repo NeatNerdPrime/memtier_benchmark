@@ -743,6 +743,32 @@ static bool verify_cluster_option(struct benchmark_config *cfg)
     return true;
 }
 
+// Returns true when `token` is one of the placeholder tokens that
+// arbitrary-command parsing recognises (__key__, __data__, __monitor_line*__,
+// __scan_cursor__). The first argv of --command must be a literal command
+// name; allowing a placeholder there is what triggers the runtime assert in
+// protocol.cpp ("first arg is not command name?"). We check at parse time so
+// the user gets a readable error instead of SIGABRT.
+static bool first_arg_is_placeholder(const std::string &token)
+{
+    // The runtime assert in protocol.cpp ("first arg is not command name?")
+    // fires on substring containment via memmem(), not exact equality, so
+    // a literal like `FOO__key__` or `setkey__key__` still SIGABRTs without
+    // this guard. Mirror the same substring contract here at parse time so
+    // the user gets a readable error instead of an abort.
+    if (token.find(KEY_PLACEHOLDER) != std::string::npos || token.find(DATA_PLACEHOLDER) != std::string::npos ||
+        token.find(SCAN_CURSOR_PLACEHOLDER) != std::string::npos ||
+        token.find(MONITOR_RANDOM_PLACEHOLDER) != std::string::npos) {
+        return true;
+    }
+    // __monitor_lineN__ (any digits / @) -- the placeholder prefix is the
+    // recognised marker; same substring rule.
+    if (token.find(MONITOR_PLACEHOLDER_PREFIX) != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
 static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 {
     if (cfg->key_pattern) {
@@ -1511,6 +1537,27 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 // Regular arbitrary command
                 arbitrary_command cmd(cmd_str);
                 if (cmd.split_command_to_args()) {
+                    // Parse-time validation: split_command_to_args() returns
+                    // true even on an empty or whitespace-only string (it
+                    // simply emits zero argv tokens). Without this guard
+                    // --command '' parses as a 0-arg command and the worker
+                    // loop spins forever (issue #426 item 13).
+                    if (cmd.command_args.empty()) {
+                        fprintf(stderr, "error: --command requires a non-empty command string.\n");
+                        return -1;
+                    }
+                    // The first argv must be a literal command name. A
+                    // placeholder there (e.g. --command __key__) trips the
+                    // assert in protocol.cpp:774 at runtime; reject it at
+                    // parse time so the user gets a readable error instead
+                    // of SIGABRT (issue #426 item 12).
+                    if (first_arg_is_placeholder(cmd.command_args[0].data)) {
+                        fprintf(stderr,
+                                "error: --command first token must be a literal command name, not the "
+                                "placeholder '%s'.\n",
+                                cmd.command_args[0].data.c_str());
+                        return -1;
+                    }
                     // Resolve key positions and reply shape from the static
                     // command_meta registry (vendored Redis commands.json).
                     // Memcached / module / unknown commands return spec=null
@@ -1548,7 +1595,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             // command configuration always applied on last configured command
             arbitrary_command &cmd = cfg->arbitrary_commands->get_last_command();
             if (!cmd.set_ratio(optarg)) {
-                fprintf(stderr, "error: failed to set ratio for command %s.\n", cmd.command_name.c_str());
+                // set_ratio() rejects empty / negative / non-integer / zero
+                // input. Zero is the most user-confusing case (the worker
+                // loop spins forever picking nothing — issue #426 item 14)
+                // so call it out explicitly.
+                fprintf(stderr, "error: --command-ratio must be a positive integer (got '%s') for command %s.\n",
+                        optarg ? optarg : "", cmd.command_name.c_str());
                 return -1;
             }
             break;
