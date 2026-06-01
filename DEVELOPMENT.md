@@ -191,6 +191,24 @@ To verify TSAN is enabled:
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
 
+### On-demand: differential tests (PR label: `run-differential`)
+
+`tests/differential_redis_benchmark.py` runs memtier alongside `redis-benchmark` and `redis-cli` against the same redis with equivalent workloads, then asserts that observable counters (total ops, hit/miss accounting, p99 latency, throughput, server-killed-mid-stream diagnostics) agree within explicit tolerances. The suite is opt-in because tolerances are wide enough to absorb cloud-runner jitter — running it on every PR would add noise without proportional signal.
+
+Trigger surface (see `.github/workflows/differential.yml`):
+
+* On a PR — attach the `run-differential` label when the change plausibly affects the protocol formatter, the RESP parser, MGET pipelining, latency accounting, or hit/miss bookkeeping:
+
+      $ gh pr edit <num> --add-label run-differential
+
+  Removing the label and pushing skips the workflow again.
+* Manually via `workflow_dispatch`.
+
+Locally (requires `redis-benchmark` and `redis-cli` on PATH):
+
+    $ RUN_DIFFERENTIAL=1 MEMTIER_BINARY=$(pwd)/memtier_benchmark \
+          pytest tests/differential_redis_benchmark.py -v
+
 ## Crash Handling and Debugging
 
 memtier_benchmark includes built-in crash handling that automatically prints a detailed bug report when the program crashes due to signals like SIGSEGV, SIGBUS, SIGFPE, SIGILL, or SIGABRT.
