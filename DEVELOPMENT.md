@@ -191,6 +191,21 @@ To verify TSAN is enabled:
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
 
+### On-demand: soak / stress (PR label: `run-soak`)
+
+The `tests/soak/` directory ships seven long-running scenarios that the regular PR CI does not exercise — memory growth over 30 minutes, multi-MB MONITOR-input payloads (regression guard for #404/#405), 32-thread / 256-client high-concurrency runs, connection churn under `CLIENT KILL`, cluster failover and reshard mid-run, retry storms against an `-ERR`-only shim, and `tc netem`-induced slow networks. They cost ~30-35 minutes of wall-clock total under a 60-minute matrix budget.
+
+Trigger surface (see `.github/workflows/soak-nightly.yml`):
+
+* Nightly cron (`17 2 * * *` UTC) — always-on baseline.
+* On a PR — attach the `run-soak` label when the change plausibly affects soak-tracked surface (memory growth, retry / reconnect, cluster handling, large-payload paths). Without the label, the workflow stays a no-op on PRs.
+
+      $ gh pr edit <num> --add-label run-soak
+
+* Manually via `workflow_dispatch`.
+
+The matrix runs `fail-fast: false` so one scenario regression does not mask the others; failures upload `tests/logs/` and `/tmp/RLTest_*` as artefacts.
+
 ## Crash Handling and Debugging
 
 memtier_benchmark includes built-in crash handling that automatically prints a detailed bug report when the program crashes due to signals like SIGSEGV, SIGBUS, SIGFPE, SIGILL, or SIGABRT.
