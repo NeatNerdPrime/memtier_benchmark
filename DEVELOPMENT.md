@@ -191,6 +191,25 @@ To verify TSAN is enabled:
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
 
+### On-demand fuzzers and soak tests (PR labels)
+
+A few longer-running test suites do not run on every PR by default — their wall-clock cost outweighs the per-PR signal — but you can opt a PR into running them by attaching a label:
+
+| Label | Workflow | What it runs | When to use |
+|---|---|---|---|
+| `run-fuzz` | `.github/workflows/monitor-fuzz.yml` | Black-box fuzz driver (`tests/fuzz/fuzz_monitor_input.py`) against `--monitor-input` / `arbitrary_command::split_command_to_args`, ASAN+UBSan build, `FUZZ_ITER=300` (~3-4 min). | Any PR that touches the monitor-input parser, the arbitrary-command splitter, or the RESP-encoded request path. |
+
+Attach a label via the CLI:
+
+    $ gh pr edit <num> --add-label run-fuzz
+
+Removing the label and pushing a new commit skips the workflow again. The same workflow also runs on a nightly cron with a larger iteration count (`FUZZ_ITER=2000`) and on manual `workflow_dispatch`. Failures upload the offending reproducer files as workflow artifacts.
+
+Locally:
+
+    $ MEMTIER=$(pwd)/memtier_benchmark FUZZ_ITER=200 \
+          python3 tests/fuzz/fuzz_monitor_input.py
+
 ## Crash Handling and Debugging
 
 memtier_benchmark includes built-in crash handling that automatically prints a detailed bug report when the program crashes due to signals like SIGSEGV, SIGBUS, SIGFPE, SIGILL, or SIGABRT.
