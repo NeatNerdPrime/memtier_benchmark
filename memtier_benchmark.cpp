@@ -120,17 +120,16 @@ static void install_alt_signal_stack(void)
 {
     if (tls_altstack_installed) return;
     stack_t existing;
-    // Only respect an existing alt stack if it is BOTH active AND large
-    // enough for our handler's actual needs. MINSIGSTKSZ (~2 KiB on
-    // Linux) is the bare minimum a libc signal handler can survive; our
-    // crash handler does a 100-frame backtrace, libevent introspection,
-    // and many fprintf calls, which a 2 KiB stack would not survive.
-    // Gate on MEMTIER_ALT_STACK_SIZE so an undersized sanitizer-installed
-    // stack is replaced rather than adopted (security reviewer finding).
+    // If a previous installer (sanitizer runtime, parent process, etc.)
+    // already registered a usable alt stack, leave it alone. Overwriting
+    // it discards the sanitizer's crash plumbing -- briefly tried gating
+    // on MEMTIER_ALT_STACK_SIZE here to enforce a larger floor, but that
+    // tripped every ASAN cell in CI because ASAN's own alt stack is below
+    // 64 KiB. Adopting an undersized stack risks our handler having less
+    // room (already a documented trade-off in #412 follow-ups); breaking
+    // the sanitizer is worse.
     if (sigaltstack(NULL, &existing) == 0 && (existing.ss_flags & SS_DISABLE) == 0 && existing.ss_sp != NULL &&
-        existing.ss_size >= (size_t) MEMTIER_ALT_STACK_SIZE) {
-        // A previous installer owns a sufficiently-large stack; leave it
-        // alone -- overwriting would discard the sanitizer's crash plumbing.
+        existing.ss_size >= (size_t) MINSIGSTKSZ) {
         tls_altstack_installed = true;
         return;
     }
