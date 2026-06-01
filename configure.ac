@@ -29,7 +29,11 @@ LT_INIT
 # working without Python installed.
 AM_PATH_PYTHON([3.6],, [:])
 
-CXXFLAGS="-O2 -g -Wall -std=c++11 $CXXFLAGS"
+dnl -Werror=vla rejects variable-length arrays at compile time. VLAs on the
+dnl worker-thread stack are how PR #405 / issue #404 shipped: an input-sized
+dnl `char buffer[N]` blew an 8-12 MB stack the moment a 20 MB MONITOR-replay
+dnl line was selected. Keep this hard-error to prevent the next one.
+CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
 
 # Checks for programs.
 AC_PROG_CXX
@@ -107,6 +111,22 @@ AS_IF([test "x$enable_thread_sanitizer" = "xyes"], [
        CXXFLAGS="$CXXFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1"
        LDFLAGS="$LDFLAGS -fsanitize=thread"
        ], [])
+
+# libFuzzer-based in-process fuzz harnesses (requires clang++).
+# When enabled, builds tests/fuzz/*_fuzz binaries under noinst_PROGRAMS.
+# Does not perturb the main memtier_benchmark binary's build flags.
+AC_ARG_ENABLE([fuzz],
+  [AS_HELP_STRING([--enable-fuzz],
+                  [Build libFuzzer harnesses under tests/fuzz/ (requires clang++)])])
+AS_IF([test "x$enable_fuzz" = "xyes"], [
+       AC_MSG_CHECKING([whether $CXX is clang++])
+       AS_CASE(["`$CXX --version 2>/dev/null | head -n 1`"],
+               [*clang*], [AC_MSG_RESULT([yes])],
+               [AC_MSG_RESULT([no])
+                AC_MSG_ERROR([--enable-fuzz requires clang++; re-run configure with CXX=clang++ CC=clang])])
+       AC_MSG_NOTICE([Enabling libFuzzer fuzz harnesses (tests/fuzz/)])
+       ], [])
+AM_CONDITIONAL([FUZZ_ENABLED], [test "x$enable_fuzz" = "xyes"])
 
 # clock_gettime requires -lrt on old glibc only.
 AC_SEARCH_LIBS([clock_gettime], [rt], , AC_MSG_ERROR([rt is required libevent.]))
