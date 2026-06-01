@@ -199,13 +199,15 @@ A few longer-running test suites do not run on every PR by default — their wal
 |---|---|---|---|
 | `run-fuzz` | `.github/workflows/monitor-fuzz.yml` | Black-box fuzz driver (`tests/fuzz/fuzz_monitor_input.py`) against `--monitor-input` / `arbitrary_command::split_command_to_args`, ASAN+UBSan build, `FUZZ_ITER=300` (~3-4 min). | Any PR that touches the monitor-input parser, the arbitrary-command splitter, or the RESP-encoded request path. |
 | `run-differential` | `.github/workflows/differential.yml` | Differential harness (`tests/differential_redis_benchmark.py`) — memtier vs `redis-benchmark` / `redis-cli` against the same redis, asserts total ops / hits / p99 latency / throughput / server-killed diagnostics agree within explicit tolerances. | Any PR that plausibly affects the protocol formatter, the RESP parser, MGET pipelining, latency accounting, or hit/miss bookkeeping. |
+| `run-soak` | `.github/workflows/soak-nightly.yml` | Seven-scenario soak / stress / chaos matrix (`tests/soak/`): 30 min memory soak (RSS slope), giant MONITOR-input payloads, 32t/256c high concurrency + FD hygiene, `CLIENT KILL` churn, cluster failover + reshard mid-run, `-ERR`-only retry storm, `tc netem` slow network. ~30-35 min total under a 60-min matrix cap. | Any PR that plausibly affects memory growth, retry / reconnect, cluster handling, or large-payload paths. |
 
 Attach a label via the CLI:
 
     $ gh pr edit <num> --add-label run-fuzz
     $ gh pr edit <num> --add-label run-differential
+    $ gh pr edit <num> --add-label run-soak
 
-Removing the label and pushing a new commit skips the workflow again. Both workflows also run on `workflow_dispatch`; `run-fuzz` additionally runs on a nightly cron with a larger iteration count (`FUZZ_ITER=2000`). Failures upload reproducer files / logs as workflow artifacts.
+Removing the label and pushing a new commit skips the workflow again. All three also run on `workflow_dispatch`; `run-fuzz` runs nightly with `FUZZ_ITER=2000` and `run-soak` runs nightly via cron. Failures upload reproducers / logs / `tests/logs/` as workflow artifacts.
 
 Local runs:
 
@@ -214,6 +216,9 @@ Local runs:
 
     $ RUN_DIFFERENTIAL=1 MEMTIER_BINARY=$(pwd)/memtier_benchmark \
           pytest tests/differential_redis_benchmark.py -v
+
+    $ MEMTIER_BINARY=$(pwd)/memtier_benchmark \
+          python3 -m RLTest --test tests/soak/test_large_payloads.py -v
 
 ## Crash Handling and Debugging
 
