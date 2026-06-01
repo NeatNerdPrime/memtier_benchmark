@@ -120,9 +120,17 @@ static void install_alt_signal_stack(void)
 {
     if (tls_altstack_installed) return;
     stack_t existing;
+    // Only respect an existing alt stack if it is BOTH active AND large
+    // enough for our handler's actual needs. MINSIGSTKSZ (~2 KiB on
+    // Linux) is the bare minimum a libc signal handler can survive; our
+    // crash handler does a 100-frame backtrace, libevent introspection,
+    // and many fprintf calls, which a 2 KiB stack would not survive.
+    // Gate on MEMTIER_ALT_STACK_SIZE so an undersized sanitizer-installed
+    // stack is replaced rather than adopted (security reviewer finding).
     if (sigaltstack(NULL, &existing) == 0 && (existing.ss_flags & SS_DISABLE) == 0 && existing.ss_sp != NULL &&
-        existing.ss_size >= (size_t) MINSIGSTKSZ) {
-        // A previous installer (sanitizer runtime, etc.) owns this; leave it.
+        existing.ss_size >= (size_t) MEMTIER_ALT_STACK_SIZE) {
+        // A previous installer owns a sufficiently-large stack; leave it
+        // alone -- overwriting would discard the sanitizer's crash plumbing.
         tls_altstack_installed = true;
         return;
     }
@@ -2138,7 +2146,13 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
     // backtrace_symbols_fd is the documented async-signal-safe variant;
     // backtrace_symbols (which mallocs) is NOT and can re-fault when the
     // crashing thread holds the malloc arena lock or the heap is corrupt.
-    fflush(fp);
+    //
+    // Intentionally NO fflush(fp) before backtrace_symbols_fd: fflush
+    // takes the FILE*'s lock, which is itself NOT async-signal-safe (it
+    // can deadlock if the crashing thread already held that lock). The
+    // backtrace output goes via the raw fd (fileno(fp)) and bypasses
+    // stdio's user-space buffer, so any interleaving with previously
+    // fprintf'd lines is acceptable -- correctness over ordering.
     if (trace_size > 1) {
         backtrace_symbols_fd(trace + 1, trace_size - 1, fileno(fp));
     }
