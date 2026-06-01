@@ -191,20 +191,26 @@ To verify TSAN is enabled:
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
 
-### On-demand: differential tests (PR label: `run-differential`)
+### On-demand fuzzers and extra suites (PR labels)
 
-`tests/differential_redis_benchmark.py` runs memtier alongside `redis-benchmark` and `redis-cli` against the same redis with equivalent workloads, then asserts that observable counters (total ops, hit/miss accounting, p99 latency, throughput, server-killed-mid-stream diagnostics) agree within explicit tolerances. The suite is opt-in because tolerances are wide enough to absorb cloud-runner jitter — running it on every PR would add noise without proportional signal.
+A few longer-running test suites do not run on every PR by default — their wall-clock cost outweighs the per-PR signal — but you can opt a PR into running them by attaching a label:
 
-Trigger surface (see `.github/workflows/differential.yml`):
+| Label | Workflow | What it runs | When to use |
+|---|---|---|---|
+| `run-fuzz` | `.github/workflows/monitor-fuzz.yml` | Black-box fuzz driver (`tests/fuzz/fuzz_monitor_input.py`) against `--monitor-input` / `arbitrary_command::split_command_to_args`, ASAN+UBSan build, `FUZZ_ITER=300` (~3-4 min). | Any PR that touches the monitor-input parser, the arbitrary-command splitter, or the RESP-encoded request path. |
+| `run-differential` | `.github/workflows/differential.yml` | Differential harness (`tests/differential_redis_benchmark.py`) — memtier vs `redis-benchmark` / `redis-cli` against the same redis, asserts total ops / hits / p99 latency / throughput / server-killed diagnostics agree within explicit tolerances. | Any PR that plausibly affects the protocol formatter, the RESP parser, MGET pipelining, latency accounting, or hit/miss bookkeeping. |
 
-* On a PR — attach the `run-differential` label when the change plausibly affects the protocol formatter, the RESP parser, MGET pipelining, latency accounting, or hit/miss bookkeeping:
+Attach a label via the CLI:
 
-      $ gh pr edit <num> --add-label run-differential
+    $ gh pr edit <num> --add-label run-fuzz
+    $ gh pr edit <num> --add-label run-differential
 
-  Removing the label and pushing skips the workflow again.
-* Manually via `workflow_dispatch`.
+Removing the label and pushing a new commit skips the workflow again. Both workflows also run on `workflow_dispatch`; `run-fuzz` additionally runs on a nightly cron with a larger iteration count (`FUZZ_ITER=2000`). Failures upload reproducer files / logs as workflow artifacts.
 
-Locally (requires `redis-benchmark` and `redis-cli` on PATH):
+Local runs:
+
+    $ MEMTIER=$(pwd)/memtier_benchmark FUZZ_ITER=200 \
+          python3 tests/fuzz/fuzz_monitor_input.py
 
     $ RUN_DIFFERENTIAL=1 MEMTIER_BINARY=$(pwd)/memtier_benchmark \
           pytest tests/differential_redis_benchmark.py -v
