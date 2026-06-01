@@ -1384,10 +1384,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: data-size-list must be expressed as [size1:weight1],...[sizeN:weightN].\n");
                 return -1;
             }
-            // Reject zero-SIZE entries (e.g. "0:50") -- they trip the
-            // value_len > 0 assert in protocol.cpp at first SET.  Zero-WEIGHT
-            // entries (e.g. "8:0") are a separate sampler-safety issue tracked
-            // for phase 3.
+            // Validate every entry in the list:
+            //   * size > 0   -- zero-size (e.g. "0:50") trips the
+            //                   value_len > 0 assert in protocol.cpp:309
+            //                   at the first SET (#426 item 9).
+            //   * size <= MEMTIER_DATA_SIZE_MAX (512 MiB matches Redis'
+            //                   default proto-max-bulk-len cap, see #428).
+            //   * weight > 0 -- zero-weight (e.g. "8:0") is silently
+            //                   skipped by the sampler and (if every
+            //                   entry has weight 0) loops forever picking
+            //                   nothing (#426 item 10, phase 3).
             for (std::vector<config_weight_list::weight_item>::iterator it = cfg->data_size_list.item_list.begin();
                  it != cfg->data_size_list.item_list.end(); ++it) {
                 if (it->size == 0) {
@@ -1402,6 +1408,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                             "error: data-size-list entry size must be <= %u bytes "
                             "(512 MiB), got %u.\n",
                             MEMTIER_DATA_SIZE_MAX, it->size);
+                    return -1;
+                }
+                if (it->weight == 0) {
+                    fprintf(stderr,
+                            "error: data-size-list entries must have weight greater than zero "
+                            "(got size=%u weight=0).\n",
+                            it->size);
                     return -1;
                 }
             }
@@ -1453,8 +1466,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_key_stddev:
             endptr = NULL;
             cfg->key_stddev = strtod(optarg, &endptr);
-            if (cfg->key_stddev <= 0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: key-stddev must be greater than zero.\n");
+            // Reject non-finite stddev (NaN, +/-inf): the Gaussian sampler's
+            // rejection loop would never produce an in-range key. Issue #426.
+            if (!endptr || *endptr != '\0' || !std::isfinite(cfg->key_stddev) || cfg->key_stddev <= 0) {
+                fprintf(stderr, "error: key-stddev must be a finite number greater than zero.\n");
                 return -1;
             }
             break;
@@ -3393,6 +3408,42 @@ int main(int argc, char *argv[])
     }
 
     config_init_defaults(&cfg);
+
+    // Reject Gaussian (G) key-pattern over a degenerate range. The sampler
+    // (gaussian_noise::gaussian_distribution_range) handles `min == max` by
+    // returning `min` directly, but the deeper hazard is the auto-computed
+    // median when `(max - min) < 2`:
+    //   median = (max - min) / 2.0 + min + 0.5
+    // For (min=1, max=2): median = 1/2.0 + 1 + 0.5 = 2.0, which trips
+    // `assert(median > min && median < max)` (2.0 < 2 is false) -> SIGABRT.
+    // The smallest range that auto-computes a strictly-inside median is
+    // (max - min) >= 2 (e.g. min=1, max=3 -> median=2.5). Reject anything
+    // tighter; bail before the assert.
+    //
+    // Note: also catch `key_maximum < key_minimum` explicitly because the
+    // unsigned subtraction below would wrap, falsely passing the >= 2 test.
+    if (cfg.key_pattern && (cfg.key_pattern[key_pattern_set] == 'G' || cfg.key_pattern[key_pattern_get] == 'G')) {
+        if (cfg.key_maximum < cfg.key_minimum || (cfg.key_maximum - cfg.key_minimum) < 2) {
+            fprintf(stderr,
+                    "error: key-pattern=G requires a key range spanning at least 3 keys "
+                    "(key-maximum - key-minimum >= 2) for the Gaussian sampler; got "
+                    "key-minimum=%llu key-maximum=%llu.\n",
+                    cfg.key_minimum, cfg.key_maximum);
+            exit(2);
+        }
+        // If the user supplied a non-zero median, it must land strictly inside
+        // (min, max) -- otherwise the sampler's `assert(median > min && median
+        // < max)` SIGABRTs. Default median=0 means "auto-compute" and (given
+        // the >= 2 range guard above) is always valid.
+        if (cfg.key_median != 0.0 &&
+            (cfg.key_median <= (double) cfg.key_minimum || cfg.key_median >= (double) cfg.key_maximum)) {
+            fprintf(stderr,
+                    "error: --key-median=%g must be strictly inside (key-minimum=%llu, key-maximum=%llu) "
+                    "for the Gaussian sampler.\n",
+                    cfg.key_median, cfg.key_minimum, cfg.key_maximum);
+            exit(2);
+        }
+    }
 
     // Open the failed-keys log if requested. Failure is reported but doesn't
     // abort the benchmark.
