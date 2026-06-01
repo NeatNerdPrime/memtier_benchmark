@@ -1,28 +1,31 @@
-name: Soak / Stress (nightly)
+name: Soak / Stress
 
 # Long-running soak / stress / chaos suite for memtier_benchmark.
-# Lives outside PR CI -- runs on a nightly cron and on manual dispatch
-# (NOT on pull_request / push, so PR CI minutes stay unaffected).
-#
-# Total budget: 60 minutes. Scenarios run as a fail-fast: false matrix so
-# one regression doesn't mask the others.
-#
-# Scenarios (see tests/soak/):
-#   S1  long_run_memory       -- 30 min soak, RSS slope check
-#   S2  large_payloads        -- regression guard for #404/#405 (giant MONITOR lines)
-#   S3  high_concurrency      -- 32t/256c, FD hygiene check
-#   S4  connection_churn      -- reconnect churn vs CLIENT KILL TYPE normal
-#   S5  cluster_turbulence    -- 3-master cluster + FAILOVER + reshard mid-run
-#   S6  retry_storm           -- python -ERR shim + --retry-on-error
-#   S7  slow_network          -- tc netem 200ms +/- 20ms, 1% loss
+# Trigger surface:
+#   * nightly cron (always-on baseline)
+#   * manual workflow_dispatch (oncall can run a subset)
+#   * PR with the `run-soak` label -- lets a PR author opt in to running
+#     the soak suite against their change before merge. Use this when the
+#     PR plausibly affects soak-tracked surface (memory growth, retry /
+#     reconnect, cluster). Add it via:
+#         gh pr edit <num> --add-label run-soak
+#     Removing the label and re-pushing skips it again.
 
 on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [master, main]
 
 jobs:
   build:
+    # On pull_request: only fire when the PR carries the `run-soak` label.
+    # On schedule / workflow_dispatch: always fire.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-soak')
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
