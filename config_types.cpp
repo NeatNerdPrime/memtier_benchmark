@@ -299,6 +299,8 @@ static int hex_digit_to_int(char c)
     }
 }
 
+// Stored as a C-string. Embedded NULs from monitor-input get truncated here —
+// full binary blob support requires a (data, len) refactor, tracked as #439.
 arbitrary_command::arbitrary_command(const char *cmd) :
         command(cmd),
         key_pattern('R'),
@@ -539,6 +541,10 @@ bool arbitrary_command::set_ratio(const char *ratio_str)
 
 bool arbitrary_command::split_command_to_args()
 {
+    // command.c_str() yields a NUL-terminated view: any embedded \0 bytes
+    // (e.g. from a binary MONITOR payload preserved by load_from_file) will
+    // terminate the pointer-walk in the loop below. Full binary blob support
+    // requires moving to a (data, len) interface throughout this path.
     const char *p = command.c_str();
     size_t command_len = command.length();
 
@@ -738,7 +744,10 @@ bool monitor_command_list::load_from_file(const char *filename)
             size_t seg_len = seg_end ? (size_t) (seg_end - seg_start) : (size_t) (line + line_len - seg_start);
 
             total_lines++;
-            // Find the first quote - this is where the command starts
+            // Find the first quote - this is where the command starts.
+            // memchr respects the explicit byte count so NUL bytes in the
+            // metadata prefix don't cause early termination (strchr stopped
+            // at \0).
             char *first_quote = (char *) memchr(seg_start, '"', seg_len);
             if (!first_quote) {
                 seg_start = seg_end ? seg_end + 1 : line + line_len;
