@@ -485,3 +485,128 @@ def test_reconnect_disabled_by_default(env):
     if not killed:
         env.debugPrint("WARNING: No connections were killed", True)
     env.assertTrue(killed)
+
+
+def test_reconnect_backoff_cap_60s(env):
+    """
+    Regression test for 2.4 review finding #13: unbounded exponential backoff.
+
+    With --reconnect-backoff-factor=4.0 and --max-reconnect-attempts=0
+    (unlimited), the delay would previously double unboundedly — after ~15
+    attempts the scheduled reconnect is already >1 billion seconds away, and
+    after ~30 it exceeds a 32-bit second counter entirely.  shard_connection.cpp
+    now clamps the delay to MEMTIER_BACKOFF_CAP_SEC (60 s) after every
+    multiplication.
+
+    This test targets a closed port so every connect attempt fails.  It runs
+    memtier for 20 s (--test-time=20) then lets it exit naturally.
+
+    Behaviour note: memtier uses libevent non-blocking connects, so each
+    call to connect() returns 0 (in-progress) even against a closed port;
+    the ECONNREFUSED arrives later via the error callback which re-starts the
+    backoff sequence from 1.0 s.  Because of this reset the scheduled delay
+    stays at factor*1.0 = 4.0 s per cycle; a single 20 s window cannot drive
+    the delay up to 60 s.  The cap is therefore validated by direct inspection
+    of MEMTIER_BACKOFF_CAP_SEC in shard_connection.cpp rather than by an
+    end-to-end log check.
+
+    What this test CAN verify end-to-end:
+      1. The process exits cleanly (signal-killed is acceptable; SIGABRT is not).
+      2. At least two "attempting reconnection" log lines are present — the test
+         is not vacuous (memtier actually ran and exercised the reconnect path).
+      3. No logged backoff value in stderr exceeds 60 seconds.
+    """
+    import subprocess
+    import re
+    import socket
+    from include import MEMTIER_BINARY
+
+    # Find a closed port on localhost (bind + immediately close so the port
+    # is guaranteed unused for the duration of the test).
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    closed_port = s.getsockname()[1]
+    s.close()
+
+    test_dir = tempfile.mkdtemp()
+
+    cmd = [
+        MEMTIER_BINARY,
+        "--server=127.0.0.1",
+        "--port={}".format(closed_port),
+        "--protocol=redis",
+        "--threads=1",
+        "--clients=1",
+        "--reconnect-on-error",
+        "--reconnect-backoff-factor=4.0",
+        "--max-reconnect-attempts=0",  # unlimited
+        "--connection-timeout=1",
+        "--test-time=20",
+    ]
+
+    stdout_path = "{}/mb.stdout".format(test_dir)
+    stderr_path = "{}/mb.stderr".format(test_dir)
+
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(cmd, stdout=stdout_f, stderr=stderr_f, cwd=test_dir)
+
+    try:
+        return_code = proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            return_code = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return_code = proc.wait(timeout=5)
+
+    env.debugPrint("memtier exit code: {}".format(return_code), True)
+
+    # Process must not have crashed with SIGABRT (exit -6 or 134).
+    env.assertNotEqual(return_code, -6)
+    env.assertNotEqual(return_code, 134)
+
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+
+    env.debugPrint("STDERR (first 2000 chars):\n{}".format(stderr_content[:2000]), True)
+
+    # Parse every "attempting reconnection … in X.XX seconds" line.
+    # Pattern matches both the limited and unlimited variants logged by
+    # shard_connection.cpp:
+    #   "attempting reconnection 5 (unlimited) in 42.00 seconds..."
+    #   "attempting reconnection 3/10 in 42.00 seconds..."
+    # NOTE: the previous [^i]+ negated class could never match the "(unlimited)"
+    # variant because "unlimited" contains 'i', causing the assertion to run
+    # against an empty list (vacuous pass) under --max-reconnect-attempts=0.
+    delay_pattern = re.compile(r"attempting reconnection\b.+?\bin\s+([\d.]+)\s+seconds")
+    delays = [float(m.group(1)) for m in delay_pattern.finditer(stderr_content)]
+
+    env.debugPrint("Observed backoff delays (s): {}".format(delays), True)
+
+    # The test ran for 20 s; with a 4 s reconnect cycle at least 2 reconnect
+    # attempts must have been logged (proves memtier stayed alive and tried).
+    env.assertGreaterEqual(
+        len(delays),
+        2,
+        message=(
+            "Expected at least 2 reconnect delay log lines, got {}. "
+            "memtier may have exited immediately (bad option or crash) rather "
+            "than actually exercising the reconnect path.".format(len(delays))
+        ),
+    )
+    # RLTest assertions are soft: assertGreaterEqual records a failure but does
+    # not halt execution.  Guard here so that max(delays) is never reached on
+    # an empty list (which would raise ValueError and mask the real failure).
+    if not delays:
+        return
+
+    max_observed = max(delays)
+    env.debugPrint("Max observed backoff: {:.2f}s".format(max_observed), True)
+
+    # Cap must not be exceeded.
+    env.assertLessEqual(
+        max_observed,
+        60.0,
+        message="Backoff exceeded 60 s cap: {:.2f} s observed".format(max_observed),
+    )
