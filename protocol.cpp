@@ -48,6 +48,15 @@ void abstract_protocol::set_keep_value(bool flag)
     m_keep_value = flag;
 }
 
+void abstract_protocol::reset_state()
+{
+    // Default: just clear m_last_response so any allocated mbulk tree /
+    // status / value strings are freed before the next connection reuses
+    // this object. Subclasses with their own parser-cursor fields (see
+    // redis_protocol) override to additionally reset those.
+    m_last_response.clear();
+}
+
 /////////////////////////////////////////////////////////////////////////
 
 protocol_response::protocol_response() :
@@ -195,10 +204,12 @@ public:
     {
     }
     virtual redis_protocol *clone(void) { return new redis_protocol(); }
+    virtual void reset_state();
     virtual int select_db(int db);
     virtual int authenticate(const char *credentials);
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
+    virtual int write_command_readonly();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -211,6 +222,34 @@ public:
     int write_arbitrary_command(const command_arg *arg);
     int write_arbitrary_command(const char *val, int val_len);
 };
+
+void redis_protocol::reset_state()
+{
+    // Discard partial-parse state from a previous connection. Without this,
+    // a TCP RST received mid-bulk under RESP3 (e.g. while draining a server
+    // push frame) leaves m_response_state at rs_read_bulk / rs_end_bulk and
+    // m_total_bulks_count / m_push / m_attribute mid-walk. The next
+    // bufferevent attached to this object would then parse fresh bytes
+    // under stale cursor state and either lose framing or silently drop a
+    // reply.
+    //
+    // m_last_response.clear() also frees any partially-built mbulk tree
+    // hanging off m_current_mbulk (the tree's root is owned by
+    // m_last_response::m_mbulk_value), so we just null the cursor here.
+    //
+    // NB: m_resp3 is intentionally preserved -- it reflects the negotiated
+    // protocol version from HELLO, not parser cursor state. A reconnect
+    // re-runs HELLO via the setup ladder, but we should not roll back the
+    // observed value here.
+    m_last_response.clear();
+    m_response_state = rs_initial;
+    m_total_bulks_count = 0;
+    m_attribute = false;
+    m_push = false;
+    m_bulk_len = 0;
+    m_response_len = 0;
+    m_current_mbulk = NULL;
+}
 
 int redis_protocol::select_db(int db)
 {
@@ -306,6 +345,19 @@ int redis_protocol::write_command_cluster_slots()
                         "$5\r\n"
                         "SLOTS\r\n",
                         28);
+
+    return size;
+}
+
+int redis_protocol::write_command_readonly()
+{
+    int size = 0;
+
+    size = evbuffer_add(m_write_buf,
+                        "*1\r\n"
+                        "$8\r\n"
+                        "READONLY\r\n",
+                        16);
 
     return size;
 }
@@ -884,6 +936,7 @@ public:
     virtual int authenticate(const char *credentials);
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
+    virtual int write_command_readonly();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -913,6 +966,11 @@ int memcache_text_protocol::configure_protocol(enum PROTOCOL_TYPE type)
 }
 
 int memcache_text_protocol::write_command_cluster_slots()
+{
+    assert(0);
+}
+
+int memcache_text_protocol::write_command_readonly()
 {
     assert(0);
 }
@@ -1115,6 +1173,7 @@ public:
     virtual int authenticate(const char *credentials);
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
+    virtual int write_command_readonly();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -1176,6 +1235,11 @@ int memcache_binary_protocol::configure_protocol(enum PROTOCOL_TYPE type)
 }
 
 int memcache_binary_protocol::write_command_cluster_slots()
+{
+    assert(0);
+}
+
+int memcache_binary_protocol::write_command_readonly()
 {
     assert(0);
 }

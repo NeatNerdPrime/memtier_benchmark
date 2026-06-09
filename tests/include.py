@@ -119,6 +119,13 @@ def addTLSArgs(benchmark_specs, env):
 
 
 def get_default_memtier_config(threads=10, clients=5, requests=1000, test_time=None):
+    """Build a default memtier_benchmark config dict.
+
+    Pass requests=None to omit --requests entirely; this is required when the
+    caller wants to bound the run by --test-time only (memtier rejects
+    --requests and --test-time as mutually exclusive). mb.py skips the
+    --requests emission when this value is None.
+    """
     config = {
         "memtier_benchmark": {
             "binary": MEMTIER_BINARY,
@@ -160,7 +167,164 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
-def get_column_csv(filename,column_name):
+def get_cluster_replica_connections(env):
+    """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
+
+    Cluster-mode only.  Requires the env was started with useSlaves=True.
+    Returns an empty list when not in cluster mode or when no replicas are
+    found (so callers can gracefully skip rather than crash).
+
+    When the env was started with ``--use-slaves`` (RLTest's useSlaves=True)
+    but CLUSTER NODES advertises no replicas, this helper emits a loud
+    stderr warning before returning an empty list.  This is the known
+    RLTest harness gap: ``--use-slaves`` starts replicas via ``--slaveof``
+    *without* ``--cluster-enabled yes``, so the slave processes are
+    standalone and never join cluster gossip.  See the
+    ``Read Preference -> Testing limitations`` section in README.md for
+    the full background.
+    """
+    import sys
+    import redis as _redis
+
+    if not env.isCluster():
+        return []
+    try:
+        any_conn = env.getOSSMasterNodesConnectionList()[0]
+        raw = any_conn.execute_command("CLUSTER", "NODES")
+    except Exception:
+        return []
+
+    # raw may be a bytes string or a plain str depending on the redis-py version
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    conns = []
+    for line in raw.strip().split("\n"):
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        flags = parts[2]
+        if "slave" not in flags and "replica" not in flags:
+            continue
+        host_part, _, _ = parts[1].partition("@")
+        host, _, port_str = host_part.rpartition(":")
+        if not port_str:
+            continue
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+        conns.append(
+            _redis.Redis(
+                host=host,
+                port=port,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+        )
+
+    # If RLTest was launched with useSlaves=True but CLUSTER NODES
+    # advertises zero replicas, emit a loud warning so the silent skip
+    # is at least visible in test output.  Use getattr() chains because
+    # RLTest's env.envRunner shape varies across versions.
+    if not conns:
+        use_slaves = False
+        runner = getattr(env, "envRunner", None)
+        if runner is not None:
+            use_slaves = bool(
+                getattr(runner, "useSlaves", False)
+                or getattr(runner, "use_slaves", False)
+            )
+        if use_slaves:
+            sys.stderr.write(
+                "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
+                "slave nodes,\nbut CLUSTER NODES shows zero replicas "
+                "(slaves were started with --slaveof\nand not "
+                "--cluster-enabled yes, so they are not in cluster "
+                "gossip).\nThe read-preference tests will skip. See README "
+                "\"Read Preference -\ntesting limitations\" for the known "
+                "harness gap.\n"
+            )
+            sys.stderr.flush()
+    return conns
+
+
+def reset_commandstats(connections):
+    """CONFIG RESETSTAT on each connection.  Use to baseline before a run."""
+    for c in connections:
+        try:
+            c.execute_command("CONFIG", "RESETSTAT")
+        except Exception:
+            pass
+
+
+def server_supports_resp3(env):
+    """Detect whether the test cluster's Redis version supports RESP3.
+
+    Capability probe used by tests that pass --protocol=resp3. RESP3 was
+    introduced in Redis 6.0, so checking the server's major version is
+    sufficient.
+
+    HELLO 3 cannot be used as a probe over a RESP2 connection: the server
+    switches wire format to RESP3 mid-reply (the response is a %7\\r\\n map),
+    redis-py's RESP2 parser fails with a protocol error, and the broad
+    ``except`` would silently classify a fully RESP3-capable Redis 6+ server
+    as "not supported" (R5 round-18 caused 3 RESP3 read-preference tests to
+    silent-skip on Redis 6+). Parse ``redis_version`` from ``INFO server``
+    instead — that reply stays RESP2 and tells us exactly what we need.
+    """
+    try:
+        conn = env.getConnection()
+        info = conn.execute_command("INFO", "server")
+        version = None
+        if isinstance(info, dict):
+            version = info.get("redis_version")
+        else:
+            # Raw bulk string fallback (older redis-py / decode_responses=True).
+            if isinstance(info, bytes):
+                info = info.decode("utf-8", errors="replace")
+            for line in info.splitlines():
+                line = line.strip()
+                if line.startswith("redis_version:"):
+                    version = line.split(":", 1)[1].strip()
+                    break
+        if not version:
+            return False
+        major = int(version.split(".")[0])
+        return major >= 6
+    except Exception:
+        return False
+
+
+def get_get_call_count(conn):
+    """Read 'cmdstat_get' from INFO COMMANDSTATS.  Returns 0 if absent."""
+    try:
+        info = conn.execute_command("INFO", "COMMANDSTATS")
+    except Exception:
+        return 0
+
+    # INFO COMMANDSTATS may be returned as a dict (redis-py >= 4) or a raw str.
+    if isinstance(info, dict):
+        stat = info.get("cmdstat_get", {})
+        return int(stat.get("calls", 0))
+
+    # Raw string fallback (older redis-py or decode_responses=True).
+    for line in info.split("\n"):
+        line = line.strip()
+        if not line.startswith("cmdstat_get:"):
+            continue
+        # format: cmdstat_get:calls=N,usec=M,...
+        for kv in line.split(":", 1)[1].split(","):
+            kv = kv.strip()
+            if kv.startswith("calls="):
+                try:
+                    return int(kv.split("=", 1)[1])
+                except ValueError:
+                    return 0
+    return 0
+
+
+def get_column_csv(filename, column_name):
     found = False
     with open(filename,"r") as fd:
         stop_line = 0

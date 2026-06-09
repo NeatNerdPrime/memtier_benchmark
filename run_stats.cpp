@@ -977,6 +977,47 @@ void run_stats::merge(const run_stats &other, int iteration)
     }
 }
 
+void run_stats::absorb_endpoint(const endpoint_snapshot &snap)
+{
+    // Coalesce by (addr, role). One JSON row per distinct endpoint regardless
+    // of how many cluster_client threads hold a shard_connection to it.
+    for (size_t i = 0; i < m_endpoint_snapshots.size(); ++i) {
+        endpoint_snapshot &e = m_endpoint_snapshots[i];
+        if (e.addr == snap.addr && e.role == snap.role) {
+            const unsigned long long total_ops = e.routed_ops + snap.routed_ops;
+            if (total_ops > 0) {
+                // Op-weighted average so endpoints that handled more traffic
+                // contribute more to the reported latency.
+                e.avg_latency_us =
+                    (e.avg_latency_us * (double) e.routed_ops + snap.avg_latency_us * (double) snap.routed_ops) /
+                    (double) total_ops;
+            }
+            e.routed_ops = total_ops;
+            // Conservative: keep the max sample count across threads to
+            // reflect "warmest" view of the endpoint.
+            if (snap.latency_samples > e.latency_samples) e.latency_samples = snap.latency_samples;
+            if (e.conn_id < 0 && snap.conn_id >= 0) e.conn_id = snap.conn_id;
+            return;
+        }
+    }
+    m_endpoint_snapshots.push_back(snap);
+}
+
+void run_stats::absorb_arbitrary_routing(size_t arbitrary_index, unsigned long long primary, unsigned long long replica)
+{
+    if (m_arbitrary_read_routing.size() <= arbitrary_index) {
+        m_arbitrary_read_routing.resize(arbitrary_index + 1);
+    }
+    m_arbitrary_read_routing[arbitrary_index].ops_from_primary += primary;
+    m_arbitrary_read_routing[arbitrary_index].ops_from_replica += replica;
+}
+
+void run_stats::absorb_builtin_get_routing(unsigned long long primary, unsigned long long replica)
+{
+    m_get_read_routing.ops_from_primary += primary;
+    m_get_read_routing.ops_from_replica += replica;
+}
+
 void run_stats::summarize(totals &result) const
 {
     // aggregate all one_second_stats
@@ -1764,6 +1805,89 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                          m_totals.m_total_latency, m_totals.m_ops, m_totals.m_connection_errors_sec,
                          m_totals.m_connection_errors, quantiles_list, m_totals.latency_histogram, timestamps,
                          total_stats);
+
+    // -----------------------------------------------------------------
+    // Read-preference observability (Step 2f).
+    //
+    // "Read Routing" sub-object: emitted whenever a non-default read
+    // preference is in effect. m_get_read_routing is only fed by
+    // cluster_client::record_builtin_read_routing — the standalone
+    // --read-server dispatch path does not yet record read-routing
+    // attribution, so gating on (!cluster_mode && !read_servers.empty())
+    // would open an empty JSON block. Restrict the gate to non-primary
+    // read_preference (cluster-only) and revisit when standalone read
+    // attribution is implemented.
+    // -----------------------------------------------------------------
+    const bool emit_read_routing = jsonhandler != NULL && m_config && m_config->read_preference != rp_primary;
+    if (emit_read_routing) {
+        const bool any = (m_get_read_routing.ops_from_primary + m_get_read_routing.ops_from_replica) > 0;
+        if (any) {
+            jsonhandler->open_nesting("Read Routing");
+            jsonhandler->write_obj("Ops from Primary", "%llu", m_get_read_routing.ops_from_primary);
+            jsonhandler->write_obj("Ops from Replica", "%llu", m_get_read_routing.ops_from_replica);
+            const unsigned long long total = m_get_read_routing.ops_from_primary + m_get_read_routing.ops_from_replica;
+            const double primary_fraction =
+                total > 0 ? (double) m_get_read_routing.ops_from_primary / (double) total : 0.0;
+            jsonhandler->write_obj("Primary Fraction", "%.4f", primary_fraction);
+            jsonhandler->close_nesting();
+        }
+
+        // Per-arbitrary-command routing breakdown.
+        if (!m_arbitrary_read_routing.empty()) {
+            jsonhandler->open_nesting("Arbitrary Read Routing");
+            for (size_t i = 0; i < m_arbitrary_read_routing.size(); ++i) {
+                if (i >= command_list.size()) break;
+                const read_routing_summary &rr = m_arbitrary_read_routing[i];
+                if (rr.ops_from_primary + rr.ops_from_replica == 0) continue;
+                jsonhandler->open_nesting(command_list[i].command_name.c_str());
+                jsonhandler->write_obj("Ops from Primary", "%llu", rr.ops_from_primary);
+                jsonhandler->write_obj("Ops from Replica", "%llu", rr.ops_from_replica);
+                const unsigned long long total = rr.ops_from_primary + rr.ops_from_replica;
+                const double primary_fraction = total > 0 ? (double) rr.ops_from_primary / (double) total : 0.0;
+                jsonhandler->write_obj("Primary Fraction", "%.4f", primary_fraction);
+                jsonhandler->close_nesting();
+            }
+            jsonhandler->close_nesting();
+        }
+    }
+
+    // "Endpoints" array: one entry per distinct shard_connection address+role.
+    // Emitted only when cluster_mode is on AND read_preference != rp_primary
+    // (the standalone --read-server clause was reverted), so both this block
+    // and "Read Routing" above share a single schema gate and we don't emit
+    // per-endpoint stats for a primary-only cluster workload where the data
+    // is uninteresting.
+    if (emit_read_routing && m_config->cluster_mode && !m_endpoint_snapshots.empty()) {
+        // Sort by (addr, role) for deterministic output. Without this the
+        // emission order tracks the thread-local absorb order, which varies
+        // run-to-run and makes mb.json diffs noisy. stable_sort preserves
+        // the merge order for ties (same addr+role -- shouldn't happen post
+        // coalescing in absorb_endpoint, but make it explicit). addr already
+        // encodes host:port so we don't need a separate port comparator.
+        std::stable_sort(m_endpoint_snapshots.begin(), m_endpoint_snapshots.end(),
+                         [](const endpoint_snapshot &a, const endpoint_snapshot &b) {
+                             if (a.addr != b.addr) return a.addr < b.addr;
+                             return a.role < b.role;
+                         });
+
+        jsonhandler->open_nesting("Endpoints");
+        for (size_t i = 0; i < m_endpoint_snapshots.size(); ++i) {
+            const endpoint_snapshot &e = m_endpoint_snapshots[i];
+            jsonhandler->open_nesting(e.addr.c_str());
+            jsonhandler->write_obj("role", "\"%s\"", e.role.c_str());
+            // conn_id is the shard_connection's vector index (NOT a stable
+            // cluster shard identity). Renamed from "shard_id" to avoid that
+            // misinterpretation. MOVED/ASK and connection-error counters are
+            // intentionally omitted here; they live in the top-level
+            // cluster_summary aggregate.
+            jsonhandler->write_obj("conn_id", "%d", e.conn_id);
+            jsonhandler->write_obj("Ops", "%llu", e.routed_ops);
+            jsonhandler->write_obj("Avg Latency (us)", "%.3f", e.avg_latency_us);
+            jsonhandler->write_obj("Latency Samples", "%u", e.latency_samples);
+            jsonhandler->close_nesting();
+        }
+        jsonhandler->close_nesting();
+    }
 
     // Add per-second active client count when staircase mode is active
     if (m_config->clients_start > 0 && jsonhandler != NULL) {

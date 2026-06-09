@@ -216,10 +216,28 @@ public:
     void set_buffers(struct evbuffer *read_buf, struct evbuffer *write_buf);
     void set_keep_value(bool flag);
 
+    // Drop any partial-parse state that would otherwise survive a
+    // bufferevent_free/reconnect cycle. The bufferevent input/output
+    // buffers themselves are owned by the bufferevent and are gone by
+    // the time we get here, so we only need to discard the in-protocol
+    // parser cursor (response_state, total_bulks_count, attribute/push
+    // drain flags, current mbulk tree) and clear m_last_response so
+    // its mbulk children are freed.
+    // The default implementation only clears m_last_response; redis_protocol
+    // overrides to also reset its parser fields. memcache subclasses keep
+    // the default for now (their state machine resets at every reply boundary
+    // and they have no RESP3-style push frame drain to leak).
+    // m_resp3 (negotiated protocol version) is intentionally NOT touched -- a
+    // TCP flap should not roll back the HELLO 3 negotiation result.
+    virtual void reset_state();
     virtual int select_db(int db) = 0;
     virtual int authenticate(const char *credentials) = 0;
     virtual int configure_protocol(enum PROTOCOL_TYPE type) = 0;
     virtual int write_command_cluster_slots() = 0;
+    // Send READONLY (cluster mode only; used to allow replica connections to
+    // serve reads). Not applicable to memcached; the memcached implementations
+    // assert(0) since the READONLY ladder is only fired for cluster replicas.
+    virtual int write_command_readonly() = 0;
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset) = 0;
     virtual int write_command_get(const char *key, int key_len, unsigned int offset) = 0;

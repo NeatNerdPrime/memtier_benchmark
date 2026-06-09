@@ -19,6 +19,8 @@
 #ifndef MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 #define MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 
+#include <atomic>
+#include <climits>
 #include <queue>
 #include <string>
 #include <netdb.h>
@@ -50,6 +52,16 @@ enum setup_state
     setup_done
 };
 
+// Topology role of a shard connection. Primary == owns slots and accepts writes.
+// Replica == read-only mirror of a primary; requires READONLY after HELLO before
+// it will serve any user traffic in cluster mode. Cluster mode only; standalone
+// replicas don't get this treatment (see P2 design brief).
+enum shard_role
+{
+    role_primary,
+    role_replica
+};
+
 enum request_type
 {
     rt_unknown,
@@ -60,7 +72,8 @@ enum request_type
     rt_auth,
     rt_select_db,
     rt_cluster_slots,
-    rt_hello
+    rt_hello,
+    rt_readonly
 };
 struct request
 {
@@ -167,7 +180,86 @@ public:
 
     enum connection_state get_connection_state() { return m_connection_state; }
 
-    int get_pending_resp() { return m_pending_resp; }
+    // Topology role accessors. Defaults to role_primary; cluster_client flips
+    // replicas to role_replica after CLUSTER SLOTS reveals them.
+    enum shard_role get_role() const { return m_role; }
+    void set_role(enum shard_role role) { m_role = role; }
+    bool is_replica() const { return m_role == role_replica; }
+
+    // READONLY ladder state accessor. setup_done means the server has
+    // acknowledged the READONLY command for this connection. Primary
+    // connections skip the ladder (m_readonly_state starts and stays
+    // setup_done) so this always returns setup_done for them.
+    enum setup_state get_readonly_state() const { return m_readonly_state; }
+
+    // Re-arm and immediately send READONLY on an already-connected replica
+    // connection whose role was just flipped from primary → replica by a live
+    // CLUSTER SLOTS refresh. Re-sets m_readonly_state to setup_none (so
+    // is_conn_setup_done() returns false) and fires the READONLY wire bytes
+    // immediately. If the connection is not yet in conn_connected state the
+    // call is a no-op: connect() will arm the ladder normally.
+    void rearm_readonly();
+
+    // True iff this connection is ready to serve user-level reads:
+    // TCP connected, cluster-slots ladder done, and (for replicas) the
+    // READONLY ladder also done. Primaries satisfy the last condition
+    // trivially because m_readonly_state is initialised to setup_done.
+    bool is_ready_for_reads() const
+    {
+        if (m_connection_state != conn_connected) return false;
+        if (m_cluster_slots != setup_done) return false;
+        // Replicas must have completed the READONLY handshake before the
+        // server will serve reads; sending a read before READONLY gets
+        // a -READONLY error from the server.
+        if (m_role == role_replica && m_readonly_state != setup_done) return false;
+        return true;
+    }
+
+    // ----------------------------------------------------------------------
+    // Read-preference observability hooks
+    // ----------------------------------------------------------------------
+    //
+    // Per-endpoint EWMA latency in microseconds. Updated on every successful
+    // response via `update_latency_ewma`. Until `m_latency_samples` reaches
+    // `LATENCY_EWMA_MIN_SAMPLES` the EWMA is treated as +inf by
+    // `nearest`-mode selection, so cold or unproven endpoints never win the
+    // lowest-latency tiebreak.
+    //
+    // Per-role op counters track how many user-level requests were routed
+    // to this endpoint. They feed the "Endpoints" array in mb.json and the
+    // "Ops from Primary"/"Ops from Replica" counts in the per-command "Read
+    // Routing" sub-object. The counters live on the connection (not on
+    // run_stats) because routing is per-conn, and the connection's role can
+    // be flipped at topology refresh time.
+    // C++11 forbids in-class initializers for static constexpr doubles
+    // (technically allowed but odr-use would require an out-of-class
+    // definition, which is brittle); wrap the constants in static inline
+    // accessors instead.
+    static double latency_ewma_alpha() { return 0.1; }
+    static unsigned int latency_ewma_min_samples() { return 10; }
+
+    double get_latency_ewma_us() const { return m_latency_ewma_us; }
+    unsigned int get_latency_samples() const { return m_latency_samples; }
+    bool latency_ewma_warm() const { return m_latency_samples >= latency_ewma_min_samples(); }
+    void update_latency_ewma(double sample_us)
+    {
+        if (m_latency_samples == 0)
+            m_latency_ewma_us = sample_us;
+        else {
+            const double a = latency_ewma_alpha();
+            m_latency_ewma_us = a * sample_us + (1.0 - a) * m_latency_ewma_us;
+        }
+        if (m_latency_samples < UINT_MAX) m_latency_samples++;
+    }
+
+    void inc_routed_ops() { m_routed_ops++; }
+    unsigned long long get_routed_ops() const { return m_routed_ops; }
+
+    // Snapshot the pending-response counter. Read by the crash-handler signal
+    // path (print_client_list) which races with worker-thread push_req/pop_req
+    // mutations; std::atomic with relaxed ordering gives TSAN a clean
+    // happens-before edge and is signal-safe for lock-free integer atomics.
+    int get_pending_resp() { return m_pending_resp.load(std::memory_order_relaxed); }
 
     // Get local port for crash reporting
     int get_local_port();
@@ -209,6 +301,15 @@ private:
     bool is_conn_setup_done();
     void send_conn_setup_commands(struct timeval timestamp);
 
+    // True iff any peer connection on this client is still climbing the
+    // setup ladder (TCP-up or in-progress, but not yet ready for reads).
+    // Used by attempt_reconnect's terminal-else to avoid tearing down the
+    // whole worker thread when ONE connection has exhausted its reconnect
+    // budget but its sibling connections are still mid-HELLO/READONLY on
+    // surviving nodes — cluster_client's routing path can fall back to
+    // those peers via the existing is_ready_for_reads() gate.
+    bool peer_client_has_any_setup_in_progress() const;
+
     request *pop_req();
     void push_req(request *req);
 
@@ -238,20 +339,36 @@ private:
     std::queue<request *> *m_pipeline;
     unsigned int m_request_per_cur_interval; // number requests to send during the current interval
 
-    int m_pending_resp;
+    // Pending-response counter. Mutated only by the connection's owning worker
+    // thread (push_req/pop_req on the libevent callback) but read from the
+    // crash-handler signal context on a foreign thread. std::atomic<int>
+    // serializes those accesses cleanly under TSAN; on every supported
+    // platform std::atomic<int> is lock-free and the loads/stores are
+    // async-signal-safe.
+    std::atomic<int> m_pending_resp;
 
     // Snapshot of the most recently pushed request's type. Updated on every
     // push_req() and read by get_last_request_type() from the crash-handler
-    // signal context; volatile + aligned int avoids the racy deref of
-    // m_pipeline->front()->m_type while worker threads mutate the queue.
-    volatile int m_last_pushed_req_type;
+    // signal context. std::atomic<int> (lock-free, signal-safe) replaces the
+    // earlier `volatile int` which was not sufficient to silence TSAN's
+    // foreign-thread read race report.
+    std::atomic<int> m_last_pushed_req_type;
 
     enum connection_state m_connection_state;
+    // Topology role; defaults to role_primary. Cluster_client sets it to
+    // role_replica after CLUSTER SLOTS reveals the connection is a replica node.
+    // Connection-scoped (preserved across reconnects so the READONLY ladder
+    // re-fires on every reconnect).
+    enum shard_role m_role;
 
     enum setup_state m_hello;
     enum setup_state m_authentication;
     enum setup_state m_db_selection;
     enum setup_state m_cluster_slots;
+    // READONLY ladder stage. Only ever leaves setup_done when m_role ==
+    // role_replica; primaries skip the stage entirely. Re-armed on every
+    // reconnect because READONLY is connection-scoped on the server side.
+    enum setup_state m_readonly_state;
 
     // Reconnection state tracking
     unsigned int m_reconnect_attempts;
@@ -288,6 +405,22 @@ private:
     // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
+
+    // EWMA of per-response latency in microseconds; see public accessors above
+    // (LATENCY_EWMA_ALPHA / LATENCY_EWMA_MIN_SAMPLES). Driven by
+    // update_latency_ewma() from the response handler. Read by the
+    // `nearest` selector in cluster_client. Per-conn, single-threaded: no
+    // synchronization needed.
+    double m_latency_ewma_us = 0.0;
+    unsigned int m_latency_samples = 0;
+
+    // Number of user-facing requests this endpoint has handled (after the
+    // routing decision lands at send-time). Distinct from m_pending_resp,
+    // which is in-flight depth, and from run_stats counters, which aggregate
+    // across endpoints and don't know about role. Bumped at send-time, not
+    // at response time, so per-endpoint Ops reflects what we routed there
+    // even when a request later fails.
+    unsigned long long m_routed_ops = 0;
 };
 
 #endif // MEMTIER_BENCHMARK_SHARD_CONNECTION_H

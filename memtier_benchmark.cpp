@@ -82,6 +82,7 @@
 #include <algorithm>
 
 #include "client.h"
+#include "cluster_client.h"
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
@@ -682,6 +683,56 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         jsonhandler->write_obj("step_duration", "%u", cfg->step_duration);
     }
 
+    // Read-preference configuration
+    {
+        const char *rp_str = "primary";
+        switch (cfg->read_preference) {
+        case rp_secondary:
+            rp_str = "secondary";
+            break;
+        case rp_secondary_preferred:
+            rp_str = "secondaryPreferred";
+            break;
+        case rp_nearest:
+            rp_str = "nearest";
+            break;
+        default:
+            rp_str = "primary";
+            break;
+        }
+        jsonhandler->write_obj("read_preference", "\"%s\"", rp_str);
+
+        const char *rpf_str = "error";
+        switch (cfg->read_preference_fallback) {
+        case rpf_queue:
+            rpf_str = "queue";
+            break;
+        case rpf_primary:
+            rpf_str = "primary";
+            break;
+        default:
+            rpf_str = "error";
+            break;
+        }
+        jsonhandler->write_obj("read_preference_fallback", "\"%s\"", rpf_str);
+        jsonhandler->write_obj("replica_clients", "%u", cfg->replica_clients);
+        jsonhandler->write_obj("replicas_per_shard", "%u", cfg->replicas_per_shard);
+
+        // --read-server entries as a comma-separated "host:port,host:port,..."
+        // string. Matches the surrounding key=value style used for
+        // data_size_list / wait-ratio / etc. Empty when no replica endpoints
+        // were given.
+        std::string read_servers_str;
+        for (size_t i = 0; i < cfg->read_servers.size(); i++) {
+            if (i > 0) read_servers_str += ",";
+            char endpoint[256];
+            snprintf(endpoint, sizeof(endpoint), "%s:%u", cfg->read_servers[i].host.c_str(),
+                     (unsigned int) cfg->read_servers[i].port);
+            read_servers_str += endpoint;
+        }
+        jsonhandler->write_obj("read_servers", "\"%s\"", read_servers_str.c_str());
+    }
+
     jsonhandler->close_nesting();
 }
 
@@ -1037,6 +1088,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_clients_start,
         o_clients_step,
         o_step_duration,
+        o_read_preference,
+        o_read_server,
+        o_command_is_read,
+        o_replica_clients,
+        o_replicas_per_shard,
+        o_read_preference_fallback,
         o_help
     };
 
@@ -1140,6 +1197,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"clients-start", 1, 0, o_clients_start},
         {"clients-step", 1, 0, o_clients_step},
         {"step-duration", 1, 0, o_step_duration},
+        {"read-preference", 1, 0, o_read_preference},
+        {"read-server", 1, 0, o_read_server},
+        {"command-is-read", 0, 0, o_command_is_read},
+        {"replica-clients", 1, 0, o_replica_clients},
+        {"replicas-per-shard", 1, 0, o_replicas_per_shard},
+        {"read-preference-fallback", 1, 0, o_read_preference_fallback},
         {NULL, 0, 0, 0}};
 
     int option_index;
@@ -1975,6 +2038,112 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
+        case o_read_preference: {
+            if (!optarg) {
+                fprintf(stderr, "error: --read-preference requires a value.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "primary") == 0) {
+                cfg->read_preference = rp_primary;
+            } else if (strcasecmp(optarg, "secondary") == 0) {
+                cfg->read_preference = rp_secondary;
+            } else if (strcasecmp(optarg, "secondaryPreferred") == 0) {
+                cfg->read_preference = rp_secondary_preferred;
+            } else if (strcasecmp(optarg, "nearest") == 0) {
+                cfg->read_preference = rp_nearest;
+            } else {
+                fprintf(stderr,
+                        "error: --read-preference must be one of: primary, secondary, "
+                        "secondaryPreferred, nearest (got '%s').\n",
+                        optarg);
+                return -1;
+            }
+            break;
+        }
+        case o_read_server: {
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "error: --read-server requires a HOST:PORT argument.\n");
+                return -1;
+            }
+            // Parse HOST:PORT.  IPv6 addresses may be bracketed: [::1]:6380.
+            // Find the colon after any closing bracket.
+            const char *rsp = optarg;
+            const char *rscolon = NULL;
+            if (*rsp == '[') {
+                const char *bracket = strchr(rsp, ']');
+                if (!bracket) {
+                    fprintf(stderr, "error: --read-server: unterminated IPv6 bracket in '%s'.\n", optarg);
+                    return -1;
+                }
+                rscolon = strchr(bracket, ':');
+            } else {
+                rscolon = strrchr(rsp, ':');
+            }
+            if (!rscolon || rscolon == rsp || !*(rscolon + 1)) {
+                fprintf(stderr, "error: --read-server: expected HOST:PORT, got '%s'.\n", optarg);
+                return -1;
+            }
+            endptr = NULL;
+            unsigned long rport = strtoul(rscolon + 1, &endptr, 10);
+            if (!endptr || *endptr != '\0' || rport == 0 || rport > 65535) {
+                fprintf(stderr, "error: --read-server: invalid port in '%s'.\n", optarg);
+                return -1;
+            }
+            std::string rhost(rsp, (size_t) (rscolon - rsp));
+            // Strip IPv6 brackets from the stored hostname
+            if (!rhost.empty() && rhost[0] == '[' && rhost[rhost.size() - 1] == ']') {
+                rhost = rhost.substr(1, rhost.size() - 2);
+            }
+            cfg->read_servers.push_back(read_server_spec(rhost, (unsigned short) rport));
+            break;
+        }
+        case o_command_is_read: {
+            if (!cfg->arbitrary_commands || cfg->arbitrary_commands->size() == 0) {
+                fprintf(stderr, "error: --command-is-read must follow a --command.\n");
+                return -1;
+            }
+            arbitrary_command &ircmd = cfg->arbitrary_commands->get_last_command();
+            ircmd.is_read_override = 1;
+            break;
+        }
+        case o_replica_clients: {
+            endptr = NULL;
+            cfg->replica_clients = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: --replica-clients must be a non-negative integer.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_replicas_per_shard: {
+            endptr = NULL;
+            cfg->replicas_per_shard = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: --replicas-per-shard must be a non-negative integer.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_read_preference_fallback: {
+            if (!optarg) {
+                fprintf(stderr, "error: --read-preference-fallback requires a value.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "error") == 0) {
+                cfg->read_preference_fallback = rpf_error;
+            } else if (strcasecmp(optarg, "queue") == 0) {
+                cfg->read_preference_fallback = rpf_queue;
+            } else if (strcasecmp(optarg, "primary") == 0) {
+                cfg->read_preference_fallback = rpf_primary;
+            } else {
+                fprintf(stderr,
+                        "error: --read-preference-fallback must be one of: error, queue, primary "
+                        "(got '%s').\n",
+                        optarg);
+                return -1;
+            }
+            break;
+        }
         default:
             return -1;
             break;
@@ -2000,6 +2169,40 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Read-preference post-parse validation
+    // ---------------------------------------------------------------------------
+
+    // --transaction and non-primary read-preference are mutually exclusive:
+    // the transaction pin model assumes all commands in a rotation target
+    // the same (primary) shard connection; routing reads to replicas inside
+    // a MULTI/EXEC block would break the atomicity guarantee.
+    if (cfg->transaction && cfg->read_preference != rp_primary) {
+        fprintf(stderr, "error: --transaction and --read-preference != primary are mutually exclusive. "
+                        "MULTI/EXEC blocks must run on the same primary connection; routing reads "
+                        "to replicas would break the atomicity guarantee.\n");
+        return -1;
+    }
+
+    // Warn when --read-preference is set but has no routing effect:
+    // in standalone mode (no --cluster-mode) the flag only works when at
+    // least one --read-server is given.
+    if (cfg->read_preference != rp_primary && !cfg->cluster_mode && cfg->read_servers.empty()) {
+        fprintf(stderr, "warning: --read-preference has no effect in standalone mode without "
+                        "--read-server. Specify at least one replica endpoint with --read-server "
+                        "HOST:PORT or add --cluster-mode.\n");
+    }
+
+    // Warn when --replica-clients is set but the read-preference does not
+    // direct any traffic to replicas. With --read-preference=primary every
+    // read still goes to the primary regardless of how many replica clients
+    // are provisioned, so the extra connections sit idle and consume
+    // resources. Mirrors the no-routing-effect warning above.
+    if (cfg->replica_clients > 0 && cfg->read_preference == rp_primary) {
+        fprintf(stderr, "warning: --replica-clients has no effect when --read-preference=primary. "
+                        "Reads only flow to replicas under secondary, secondaryPreferred, or nearest.\n");
     }
 
     // --transaction needs at least one --command to operate on. In
@@ -2212,6 +2415,36 @@ void usage()
         "      --scan-incremental-max-iterations=NUMBER\n"
         "                                 Maximum number of continuation SCANs per iteration cycle\n"
         "                                 (default: 0, follow cursor until it returns 0).\n"
+        "      --command-is-read          Mark the preceding --command as a read operation for\n"
+        "                                 --read-preference routing (per-command override).\n"
+        "\n"
+        "Read Preference Options:\n"
+        "      --read-preference=MODE     Which node class receives read commands (default: primary).\n"
+        "                                 primary           - all reads go to the master/primary node\n"
+        "                                 secondary         - all reads go to replica nodes only\n"
+        "                                 secondaryPreferred - replicas preferred; fall back to primary\n"
+        "                                 nearest           - EWMA-based selection: seed cold replicas\n"
+        "                                                     round-robin until warm, then route reads\n"
+        "                                                     to the lowest-EWMA endpoint among warm\n"
+        "                                                     replicas (primary may participate if it\n"
+        "                                                     has accumulated samples)\n"
+        "      --read-server=HOST:PORT    Replica endpoint for standalone (non-cluster) mode.\n"
+        "                                 Repeatable; each occurrence adds one replica endpoint.\n"
+        "                                 IPv6 addresses may be given as [::1]:6380.\n"
+        "                                 NOTE: parsed but read dispatch is currently cluster-only;\n"
+        "                                 see README \"Read Preference\" section.\n"
+        "      --replica-clients=N        Connections per replica per client thread (default: 0 = inherit\n"
+        "                                 --clients) (parsed but not yet wired - see README\n"
+        "                                 \"Read Preference\" section).\n"
+        "      --replicas-per-shard=K     Cap on replicas used per shard (default: 0 = all) (parsed but\n"
+        "                                 not yet wired - see README \"Read Preference\" section).\n"
+        "      --read-preference-fallback=MODE\n"
+        "                                 What to do when the target node class is unavailable\n"
+        "                                 (default: error).\n"
+        "                                 error   - return an error\n"
+        "                                 queue   - (reserved; currently treated as 'error' - request\n"
+        "                                           queuing not yet implemented)\n"
+        "                                 primary - fall back silently to the primary\n"
         "\n"
         "Object Options:\n"
         "  -d  --data-size=SIZE           Object data size in bytes (default: 32)\n"
@@ -3049,6 +3282,54 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
         (*i)->m_cg->merge_run_stats(&stats);
+    }
+
+    // -----------------------------------------------------------------
+    // Read-preference observability snapshot.
+    //
+    // After threads have joined but before the worker structures are torn
+    // down, walk every client_group -> client -> shard_connection so the
+    // run_stats holds the per-endpoint EWMA + routed_ops + role + the
+    // per-command routing counters (cluster_client only). Once
+    // run_benchmark returns the worker pointers are gone, so this is the
+    // last chance to capture the state.
+    // -----------------------------------------------------------------
+    for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+        client_group *cg = (*i)->m_cg;
+        std::vector<client *> &clients = cg->get_clients();
+        for (size_t ci = 0; ci < clients.size(); ++ci) {
+            client *c = clients[ci];
+            if (c == NULL) continue;
+            const std::vector<shard_connection *> &conns = c->get_connections();
+            for (size_t k = 0; k < conns.size(); ++k) {
+                shard_connection *sc = conns[k];
+                if (sc == NULL) continue;
+                endpoint_snapshot snap;
+                {
+                    const char *addr = sc->get_address();
+                    const char *port = sc->get_port();
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "%s:%s", addr ? addr : "?", port ? port : "?");
+                    snap.addr = buf;
+                }
+                snap.role = sc->is_replica() ? "replica" : "primary";
+                snap.conn_id = (int) sc->get_id();
+                snap.routed_ops = sc->get_routed_ops();
+                snap.avg_latency_us = sc->get_latency_ewma_us();
+                snap.latency_samples = sc->get_latency_samples();
+                stats.absorb_endpoint(snap);
+            }
+            // Per-command Read-Routing counters live on cluster_client.
+            cluster_client *cc = dynamic_cast<cluster_client *>(c);
+            if (cc != NULL) {
+                const std::vector<cluster_client::read_routing_counters> &arr = cc->get_arbitrary_routing_counters();
+                for (size_t ai = 0; ai < arr.size(); ++ai) {
+                    stats.absorb_arbitrary_routing(ai, arr[ai].ops_from_primary, arr[ai].ops_from_replica);
+                }
+                const cluster_client::read_routing_counters &g = cc->get_get_routing_counters();
+                stats.absorb_builtin_get_routing(g.ops_from_primary, g.ops_from_replica);
+            }
+        }
     }
 
     // Do we need to produce client stats?
