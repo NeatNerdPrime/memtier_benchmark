@@ -303,15 +303,19 @@ S for Sequential selection.
 R for Random selection.
 .TP
 \fB\-\-scan\-incremental\-iteration\fR
-Enable SCAN cursor iteration mode. When used with
-\fB\-\-command=\fR"SCAN 0 [MATCH pattern] [COUNT count] [TYPE type]",
-automatically follows the cursor returned by each SCAN response.
-Sends "SCAN 0 ..." initially, then "SCAN <cursor> ..." until
+Enable cursor iteration for SCAN, SSCAN, HSCAN and ZSCAN.
+Use \fB\-\-command=\fR"SCAN 0 ..." or \fB\-\-command=\fR"HSCAN key 0 ...", etc.
+Automatically follows the cursor returned by each response.
+Sends the supplied command initially and updates its cursor until
 the cursor returns 0, then restarts. Requires \fB\-\-pipeline\fR 1.
-Stats are reported separately for "SCAN 0" and "SCAN <cursor>".
+Stats separate "<COMMAND> 0" from "<COMMAND> <cursor>".
+For compatibility, the initial statistics label remains 0 even with a nonzero
+starting cursor; each new walk starts at the supplied cursor.
+Collection keys and generated arguments stay fixed per cursor walk.
+Requires one \fB\-\-command\fR and standalone Redis (no cluster mode).
 .TP
 \fB\-\-scan\-incremental\-max\-iterations\fR=\fI\,NUMBER\/\fR
-Maximum number of continuation SCANs per iteration cycle
+Maximum number of continuations per cursor walk
 (default: 0, follow cursor until it returns 0).
 .TP
 \fB\-\-command\-is\-read\fR

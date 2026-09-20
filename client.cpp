@@ -103,6 +103,10 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 
     // Enable value keeping for SCAN incremental iteration (needed to extract cursor from response)
     if (config->scan_incremental_iteration) {
+        // The copied commands have matching argument indices; bound both consumers
+        // of the generated-argument cache even in release builds.
+        m_scan_args.resize(std::max(config->arbitrary_commands->at(0).command_args.size(),
+                                    config->scan_continuation_command->command_args.size()));
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
@@ -472,6 +476,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
     }
 
     // Normal arbitrary command handling
+    const bool scan_incremental_iteration = m_config->scan_incremental_iteration;
     for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
         const command_arg *arg = &cmd.command_args[i];
         if (arg->type == const_type) {
@@ -504,8 +509,15 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
                 }
             }
 
-            // when we have static data mixed with the key placeholder
-            if (arg->has_key_affixes) {
+            if (scan_incremental_iteration) {
+                assert(i < m_scan_args.size());
+                m_scan_args[i] = arg->data_prefix;
+                m_scan_args[i].append(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+                m_scan_args[i].append(arg->data_suffix);
+                cmd_size +=
+                    m_connections[conn_id]->send_arbitrary_command(arg, m_scan_args[i].data(), m_scan_args[i].size());
+            } else if (arg->has_key_affixes) {
+                // Static data mixed with the key placeholder.
                 // Pre-calculate total length to avoid reallocations
                 const char *key = m_obj_gen->get_key();
                 unsigned int key_len = m_obj_gen->get_key_len();
@@ -552,6 +564,10 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             assert(value != NULL);
             assert(value_len > 0);
 
+            if (scan_incremental_iteration) {
+                assert(i < m_scan_args.size());
+                m_scan_args[i].assign(value, value_len);
+            }
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
         }
     }
@@ -575,18 +591,10 @@ bool client::create_scan_continuation_request(struct timeval &timestamp, unsigne
         } else if (arg->type == scan_cursor_type) {
             cmd_size +=
                 m_connections[conn_id]->send_arbitrary_command(arg, m_scan_cursor.c_str(), m_scan_cursor.length());
-        } else if (arg->type == key_type) {
-            unsigned long long key_index;
-            get_key_response res = get_key_for_conn(0, conn_id, &key_index);
-            assert(res == available_for_conn);
-            cmd_size +=
-                m_connections[conn_id]->send_arbitrary_command(arg, m_obj_gen->get_key(), m_obj_gen->get_key_len());
-        } else if (arg->type == data_type) {
-            unsigned int value_len;
-            const char *value = m_obj_gen->get_value(0, &value_len);
-            assert(value != NULL);
-            assert(value_len > 0);
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
+        } else if (arg->type == key_type || arg->type == data_type) {
+            assert(i < m_scan_args.size());
+            const std::string &value = m_scan_args[i];
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value.data(), value.size());
         }
     }
 
@@ -670,6 +678,8 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
                 }
             } else {
                 // Send initial SCAN 0, stats to index 0
+                // Release the transaction key pin before selecting the next scan key.
+                m_txn_rotation_key_valid = false;
                 if (create_arbitrary_request(0, timestamp, conn_id)) {
                     m_reqs_generated++;
                 }
