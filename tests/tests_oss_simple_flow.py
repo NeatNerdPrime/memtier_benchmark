@@ -1003,6 +1003,128 @@ def test_uri_with_database_selection(env):
     env.assertTrue(memtier_ok)
 
 
+def test_uri_authentication_ownership(env):
+    """URI fields own storage; omitted fields retain CLI credentials and CLI/default hosts."""
+    env.skipOnUnixSocket()
+    env.skipOnVersionSmaller('6.0.0')  # Named users require Redis ACL support.
+    nodes = env.getMasterNodesList()
+    connections = env.getOSSMasterNodesConnectionList()
+    user = 'memtier-uri-auth-ownership'
+    password = 'uri-auth-password:with-colon'
+    credentials = '{}:{}'.format(user, password)
+    endpoint = '{}:{}'.format(nodes[0].get('host') or '127.0.0.1', nodes[0]['port'])
+    uri = '--uri=redis://{}'.format(endpoint)
+    authenticated_uri = '--uri=redis://{}@{}'.format(credentials, endpoint)
+    auth = '--authenticate={}'.format(credentials)
+    bad_auth = '--authenticate={}:incorrect'.format(user)
+    empty_host_uri = '--uri=redis://:{}'.format(nodes[0]['port'])
+    # Name each warning that should be emitted; omitted URI fields never override CLI values.
+    cases = [
+        ('wrong-named-user-password', [bad_auth], set()),
+        ('cli-before-uri', [auth, uri], {'host', 'port'}),
+        ('cli-after-uri', [uri, auth], {'host', 'port'}),
+        ('uri-before-cli', [authenticated_uri, bad_auth], {'auth', 'host', 'port'}),
+        ('uri-after-cli', [bad_auth, authenticated_uri], {'auth', 'host', 'port'}),
+        ('auth-only', [auth], set()),
+        ('repeated-auth', [bad_auth, '-a', credentials, uri], {'host', 'port'}),
+        ('repeated-uri', [authenticated_uri, uri, auth], {'host', 'port'}),
+        ('uri-only', [authenticated_uri], {'host', 'port'}),
+        ('empty-host-cli-server', [auth, empty_host_uri], {'port'}),
+        ('uri-no-cli-server', [auth, uri], set()),
+        ('uri-localhost-cli-server', [auth, uri, '--server=localhost'], {'host', 'port'}),
+        ('uri-omitted-port', [auth, '--uri=redis://' + endpoint.rsplit(':', 1)[0]], {'host'}),
+        ('uri-empty-fields', [auth, '--uri=redis://'], set()),
+        ('uri-db-overrides-cli', [auth, uri + '/0', '--select-db=1'], {'host', 'port', 'db'}),
+        ('uri-db-only', [auth, uri + '/0'], {'host', 'port'}),
+        ('uri-db-zero-cli', [auth, uri + '/0', '--select-db=0'], {'host', 'port'}),
+    ]
+    if nodes[0].get('host') in (None, 'localhost', '127.0.0.1'):
+        cases.append(('empty-host-default-server', [auth, empty_host_uri, '--ipv4'], set()))
+    if not env.isCluster():
+        cases.extend([
+            ('uri-omitted-db', [auth, uri, '--select-db=1'], {'host', 'port'}),
+            ('uri-empty-db', [auth, uri + '/', '--select-db=1'], {'host', 'port'}),
+        ])
+    if env.useTLS:
+        rediss_uri = uri.replace('redis://', 'rediss://', 1)
+        cases.extend([
+            ('rediss-with-cli-tls', [auth, rediss_uri], {'host', 'port', 'tls'}),
+            ('rediss-without-cli-tls', [auth, rediss_uri], {'host', 'port'}),
+        ])
+    warning_options = {'auth': '--authenticate', 'host': '--host/--server',
+                       'port': '--port', 'db': '--select-db', 'tls': '--tls'}
+    created = []
+    try:
+        for connection in connections:
+            connection.execute_command('ACL', 'SETUSER', user, 'reset', 'on',
+                                       '>' + password, '~*', '+@all')
+            created.append(connection)
+        for name, args, expected_warnings in cases:
+            specs = {'name': env.testName + '-' + name,
+                     'args': args + ['--ratio=1:0', '--hide-histogram',
+                                     '--connection-stage-timeout=5']}
+            addTLSArgs(specs, env)
+            if name == 'rediss-without-cli-tls':
+                specs['args'].remove('--tls')
+            config = get_default_memtier_config(threads=1, clients=1, requests=10)
+            add_required_env_arguments(specs, config, env, nodes)
+            if name in ('empty-host-default-server', 'uri-no-cli-server'):
+                # The URI supplies the private port; keep Benchmark from
+                # inserting an explicit --server argument.
+                config['memtier_benchmark']['explicit_connect_args'] = True
+            with tempfile.TemporaryDirectory() as directory:
+                config = RunConfig(directory, specs['name'], config, {})
+                ensure_clean_benchmark_folder(config.results_dir)
+                benchmark = Benchmark.from_json(config, specs)
+                ok = benchmark.run(timeout=20)
+                with open(os.path.join(config.results_dir, 'mb.stderr')) as result:
+                    stderr = result.read()
+                for field, option in warning_options.items():
+                    env.assertEqual('both URI and {} specified'.format(option) in stderr,
+                                    field in expected_warnings, message=name + ':' + field)
+                if name == 'wrong-named-user-password':
+                    env.assertFalse(ok, message=name)
+                    env.assertFalse(os.path.exists(os.path.join(config.results_dir, 'mb.timeout')))
+                    env.assertContains('authentication failed', stderr)
+                    continue
+                if not ok:
+                    debugPrintMemtierOnError(config, env)
+                env.assertTrue(ok, message=name)
+                if not ok:
+                    continue
+                with open(os.path.join(config.results_dir, 'mb.json')) as result:
+                    stats = json.load(result)['ALL STATS']
+                env.assertEqual(stats['Sets']['Count'], 10, message=name)
+                env.assertEqual(stats['Totals']['Count'], 10, message=name)
+    finally:
+        for connection in created:
+            connection.execute_command('ACL', 'DELUSER', user)
+
+
+def test_uri_authentication_parse_errors(env):
+    """Reject invalid URI fields even after URI credentials replace CLI auth."""
+    for uri, error in [
+        ('redis://user:password@127.0.0.1:invalid', 'invalid port number'),
+        ('redis://password@127.0.0.1:1/invalid', 'invalid database number'),
+        ('invalid://user:password@127.0.0.1:1', 'unsupported URI scheme'),
+    ]:
+        result = subprocess.run(
+            [MEMTIER_BINARY, '--authenticate=cli-password', '--uri=' + uri],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        env.assertEqual(result.returncode, 1)
+        env.assertContains(error, result.stderr.decode('utf-8', 'replace'))
+
+    # An explicit default port is still a CLI value. Cluster DB validation
+    # stops this parse-only check before any connection can be attempted.
+    result = subprocess.run(
+        [MEMTIER_BINARY, '--port=6379', '--cluster-mode', '--uri=redis://127.0.0.1:1/1'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    env.assertEqual(result.returncode, 1)
+    stderr = result.stderr.decode('utf-8', 'replace')
+    env.assertContains('database selection not supported in cluster mode', stderr)
+    env.assertContains('both URI and --port specified', stderr)
+
+
 def test_uri_invalid_scheme(env):
     """Test URI with invalid scheme"""
     # Test invalid scheme

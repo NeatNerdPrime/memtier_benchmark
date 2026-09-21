@@ -834,7 +834,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
-static int parse_uri(const char *uri, struct benchmark_config *cfg)
+static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
+                     std::string &uri_server)
 {
     if (!uri || strlen(uri) == 0) {
         fprintf(stderr, "error: empty URI provided.\n");
@@ -863,6 +864,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
         // Regular Redis connection
     } else if (strcmp(ptr, "rediss") == 0) {
 #ifdef USE_TLS
+        if (cfg->tls) {
+            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
+        }
         cfg->tls = true;
 #else
         fprintf(stderr, "error: TLS not supported in this build.\n");
@@ -882,29 +886,13 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
     char *host_start = ptr;
 
     if (auth_end) {
-        // Authentication present
-        *auth_end = '\0';
-        char *colon = strchr(ptr, ':');
-        if (colon) {
-            // user:password format
-            *colon = '\0';
-            char *user = ptr;
-            char *password = colon + 1;
-
-            // Combine as user:password for authenticate field
-            int auth_len = strlen(user) + strlen(password) + 2;
-            char *auth_str = (char *) malloc(auth_len);
-            if (!auth_str) {
-                fprintf(stderr, "error: memory allocation failed.\n");
-                free(uri_copy);
-                return -1;
-            }
-            snprintf(auth_str, auth_len, "%s:%s", user, password);
-            cfg->authenticate = auth_str;
-        } else {
-            // Just password (default user)
-            cfg->authenticate = strdup(ptr);
+        if (cfg->authenticate) {
+            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
         }
+        // Own URI credentials separately from the borrowed --authenticate argument.
+        *auth_end = '\0';
+        uri_authenticate = ptr;
+        cfg->authenticate = uri_authenticate.c_str();
         host_start = auth_end + 1;
     }
 
@@ -920,6 +908,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
                 fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
                 free(uri_copy);
                 return -1;
+            }
+            if (cfg->select_db) {
+                fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
             }
             cfg->select_db = db;
         }
@@ -937,12 +928,19 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
             free(uri_copy);
             return -1;
         }
+        if (cfg->port) {
+            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
+        }
         cfg->port = (unsigned short) port;
     }
 
-    // Set host
+    // Own URI hosts separately from a borrowed --server argument or the default.
     if (strlen(host_start) > 0) {
-        cfg->server = strdup(host_start);
+        if (cfg->server) {
+            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
+        }
+        uri_server = host_start;
+        cfg->server = uri_server.c_str();
     }
 
     free(uri_copy);
@@ -4312,6 +4310,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
 
+    // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
+    std::string uri_authenticate;
+    std::string uri_server;
     benchmark_config cfg = benchmark_config();
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
@@ -4538,26 +4539,7 @@ int main(int argc, char *argv[])
 
     // Process URI if provided
     if (cfg.uri) {
-        // Check for conflicts with individual connection parameters
-        if (cfg.server && strcmp(cfg.server, "localhost") != 0) {
-            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
-        }
-        if (cfg.port && cfg.port != 6379) {
-            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
-        }
-        if (cfg.authenticate) {
-            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
-        }
-        if (cfg.select_db) {
-            fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
-        }
-#ifdef USE_TLS
-        if (cfg.tls) {
-            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
-        }
-#endif
-
-        if (parse_uri(cfg.uri, &cfg) < 0) {
+        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server) < 0) {
             exit(1);
         }
 
@@ -5305,16 +5287,6 @@ int main(int argc, char *argv[])
 
     if (cfg.monitor_commands != NULL) {
         delete cfg.monitor_commands;
-    }
-
-    // Clean up dynamically allocated strings from URI parsing
-    if (cfg.uri) {
-        if (cfg.server) {
-            free((void *) cfg.server);
-        }
-        if (cfg.authenticate) {
-            free((void *) cfg.authenticate);
-        }
     }
 
     // Clean up StatsD client
